@@ -1,0 +1,6 @@
+boto3
+openai
+pandas
+pdfminer.six
+simple_salesforce
+pdfplumber

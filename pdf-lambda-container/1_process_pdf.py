@@ -2,18 +2,12 @@ import asyncio
 import boto3
 import time
 import uuid
-import json
 import logging
-from urllib.parse import unquote_plus
 from pdf_parser import PDFParser
-from contract_extractor import ContractExtractor
-from salesforce import SalesForce
-from docv import DocV
-from watchlist import Watchlist
 
 logger = logging.getLogger(__name__)
 
-async def lambda_handler(event, context):  # Make this async
+async def process_pdf(event, context):  # Make this async
     """
     Process a single PDF file using OpenAI OCR
     """
@@ -35,59 +29,35 @@ async def lambda_handler(event, context):  # Make this async
         
         # Initialize important classes
         pdf_parser = PDFParser()
-        extractor = ContractExtractor()
-        sf = SalesForce()
-        doc_v = DocV()
-        watchlist = Watchlist()
         
         # Process the PDF
         start_time = time.time()
         parsed_content = await pdf_parser.parse_pdf_from_s3(pdf_content)  # Add await
         
-        # If any of these also have async methods, add await
-        all_json = await extractor.extract_contract_pipeline(  # Add await if needed
-            input_pdf=pdf_content,
-            extracted_text=parsed_content,
-            file_name=file_name
-        )
-
-        output_all_json = sf.main(data=all_json)  # Add await if needed
-        
-        docv_all_json = doc_v.main(  # Add await if needed
-            parsed_input=parsed_content,
-            output_all_json=output_all_json
-        )
-        
-        watchlist_all_json = watchlist.main(  # Add await if needed
-            parsed_input=parsed_content,
-            output_all_json=docv_all_json
-        )
-        
         processing_time = time.time() - start_time
 
         # Store large content in S3
-        result_key = f"results/{uuid.uuid4()}_{file_name}_processed.json"
+        result_key = f"processed/{uuid.uuid4()}_{file_name}_parsed.txt"
 
         s3_client.put_object(
             Bucket=bucket_name,
             Key=result_key,
-            Body=json.dumps(watchlist_all_json, indent=2),
-            ContentType='application/json'
+            Body=parsed_content,
+            ContentType='text/plain'
         )
-
-
 
         # Return only small metadata with S3 reference
         results = {
             'fileName': file_name,
             'status': 'success',
+            'bucket': bucket_name,
+            'key': file_key,
+            'parsedLocation': f"s3://{bucket_name}/{result_key}",
             'processingTime': round(processing_time, 2),
-            'resultLocation': f"s3://{bucket_name}/{result_key}",
-            'contentSize': len(json.dumps(watchlist_all_json)),
-            'processedAt': context.aws_request_id
+            'stage': 'text_extraction_complete'
         }
         
-        logger.info(f"Successfully processed: {file_name}")
+        logger.info(f"Successfully extracted text from: {file_name}")
         
         return results
         
@@ -102,4 +72,4 @@ async def lambda_handler(event, context):  # Make this async
 # Lambda wrapper for async handler
 def handler(event, context):
     """Wrapper to run async lambda_handler"""
-    return asyncio.run(lambda_handler(event, context))
+    return asyncio.run(process_pdf(event, context))
