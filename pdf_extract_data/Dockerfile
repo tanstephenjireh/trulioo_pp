@@ -12,5 +12,9 @@ COPY contract_extractor.py ${LAMBDA_TASK_ROOT}
 COPY docv.py ${LAMBDA_TASK_ROOT}
 COPY salesforce.py ${LAMBDA_TASK_ROOT}
 COPY watchlist.py ${LAMBDA_TASK_ROOT}
+COPY fraud.py ${LAMBDA_TASK_ROOT}
+COPY workflow.py ${LAMBDA_TASK_ROOT}
+COPY validation.py ${LAMBDA_TASK_ROOT}
+COPY trulioo-af66af3a3788.json ${LAMBDA_TASK_ROOT}
 
 CMD ["2_extract_data.handler"]

@@ -1,4 +1,3 @@
-import re
 import json
 import logging
 import asyncio
@@ -9,12 +8,12 @@ from simple_salesforce import Salesforce
 # Configure logging
 logger = logging.getLogger(__name__)
 
-class Watchlist:
+class Fraud:
 
     def __init__(self):
         # ========== ENV SETUP ==========
         self.OPENAI_API_KEY = get_ssm_param("/myapp/openai_api_key")
-        # self.WATCHLIST_INSTRUCTION = get_ssm_param("/myapp/watchlist_prompt")
+        # self.DOCV_INSTRUCTION = get_ssm_param("/myapp/docv_prompt")
         self.openai = AsyncOpenAI(api_key=self.OPENAI_API_KEY)
 
         self.username = get_ssm_param("/myapp/sf_username")
@@ -22,35 +21,37 @@ class Watchlist:
         self.security_token = get_ssm_param("/myapp/sf_security_token")
         self.domain = get_ssm_param("/myapp/sf_domain")
 
-        self.WATCHLIST_INSTRUCTION = """
-        You are an intelligent field extractor. You are given a chunk of a document that may contain two relevant sections:
-            1. Selected Services and Pricing: Watchlist
-            2. Watchlist Tier Pricing
+        self.FRAUD_INTELLIGENCE_INSTRUCTION = """
+        You are an intelligent field extractor. You are given a chunk of a document that may contain up to three relevant sections:
+            1. Selected Services and Pricing: Fraud Intelligence
+            2. Fraud Intelligence – Person Fraud Tier Pricing
+            3. Fraud Intelligence – Person Fraud Surcharge
+
         If a value is not present or no chunk was provided, return "NA". Do not leave any field blank.
 
-        ## `subscription` (subscription level fields).
+        ## `subscription` (subscription-level fields).
         Do this for each Name. One Name is one Subscription. 
-        From Section: Selected Services and Pricing: Watchlist
-            - `ProductName`: Extract the Name listed in this section. 
-            - `CurrencyIsoCode`: get the ISO currency code from the “Price Per Query” column or From Section: Watchlist Tier Pricing whicever is the price of the Name. 
-                - If "$", it is automatically USD. 
-                - NA if there is no price.
-                
-        ##  `scr` (subscription consumption rate for this subscription)      
-        For the Item Name above, find the corresponding prices. It may be dependent on tier pricing table under Watchlist Tier Pricing: .
-            - `subCrName`: The name or identifier of the price. 
-                - Assigned "<Name> Consumption Rate" if the price is not tiered.
-                - Assigned "<Name Tier <<n>> Consumption Rate" if the price is tiered.
-            - `LowerBound__c`: The monthly volume lower bound for tiered. "1" if none.
-            - `UpperBound__c`: The monthly volume upper bound for tiered. NA if none.
-            - `Price__c`: The value`: 
-                - from the "Price per Query" column for tiered, 
-                - from the "Fee per Qeuery" if non tiered.
-                - extract only the value without the currency.
-            - `CurrencyIsoCode`: get the ISO currency code from the “Price Per Query” column or From Section: Watchlist Tier Pricing whicever is the price of the Name. 
-                - If "$", it is automatically USD. 
-                - NA if there is no price.
-            
+        From Section: Selected Services and Pricing: Fraud Intelligence
+            - `ProductName`: Extract the Name listed in this section (e.g. "Fraud Intelligence – Person Fraud").
+            - `CurrencyIsoCode`: Get the ISO currency code from the “Price Per Query” column, or from Tier Pricing/Surcharge. 
+                - If "$", it is automatically USD.
+                - Return "NA" if there is no price.
+
+        ## `scr` (subscription consumption rate for this subscription)
+        For each ProductName above, find the corresponding pricing details from Fraud Intelligence – Person Fraud Tier Pricing.
+        Disregard ## Fraud Intelligence – Person Fraud Surcharge if present.
+            - `subCrName`: The name or identifier of the price or tier. 
+                - Use "<Name> Consumption Rate" if the price is not tiered.
+                - Use "<Name Tier <n>> Consumption Rate" if the price is tiered.
+                - Use "<Name Surcharge>" for surcharges if applicable.
+            - `LowerBound__c`: The monthly volume lower bound for tiered pricing (Including 0). Use "1" if the price is not dependent on a range. 
+            - `UpperBound__c`: The monthly volume upper bound for tiered pricing. Use "NA" if none.
+            - `Price__c`: The value:
+                - From the "Price per Query" column for tiered.
+                - From the "Fee per Query" column for non-tiered.
+                - Extract only the number, **without** the currency symbol.
+            - `CurrencyIsoCode`: Get the ISO currency code from the relevant price. If "$", it is automatically USD. Return "NA" if not present.
+
         Return the extracted data as a structured JSON object, formatted as follows:
         ```json
         {
@@ -62,27 +63,30 @@ class Watchlist:
             {
             <Subscription2-level fields>,
             "scr": [ ...subscription consumption rate for this subscription... ]
-            },
+            }
         ]
         }
-        ```
-
         """
 
-    async def call_llm_for_watchlist_boundaries(self, full_text):
+    # ========= BOUNDARY FINDER ==============
+    async def call_llm_for_fraud_boundaries(self, full_text):
+        """
+        Uses LLM to find the start and end line (as exact line text) of the Fraud Intelligence section.
+        Returns a dict: {"start_line": "...", "end_line": "..."} or None if not found.
+        """
         system_prompt = (
             "You are an expert contract parser. "
-            "Your job is to find the exact line text that marks the START and END of the Watchlist section in the contract below."
+            "Your job is to find the exact line text that marks the START and END of the Fraud Intelligence section in the contract below."
         )
         user_prompt = f"""
     # Instructions:
-    ### START OF WATCHLIST ###
-    - Find the line that marks the START of the Watchlist block. This may be a header containing ' # Selected Services and Pricing: Watchlist' (or similar such as "# Selected Services & Pricing: Watchlist". There may be slight naming variations such as but not limited to spacing and ampersand). 
-        - A Watchlist block may also be associated with a section '# Watchlist Tier Pricing'
-    - The END of the Watchlist block is the first line AFTER the Watchlist section that is clearly a new section (such as another "# ..." section header about a different product, e.g. '# Selected Services and Pricing: Identity Document Verification', '# Selected Services and Pricing: Workflow Studio', etc.), or the end of the document if nothing follows.
+    ### START OF FRAUD INTELLIGENCE ###
+    - Find the line that marks the START of the Fraud Intelligence block. This may be a line containing 'Selected Services and Pricing: Fraud Intelligence'.
+        - A Fraud Intelligence block may also be associated with sections like '# Fraud Intelligence – Person Fraud Tier Pricing' or '# Fraud Intelligence – Person Fraud Surcharge'.
+    - The END of the Fraud Intelligence block is the first line AFTER the Fraud Intelligence section that is clearly a new section (such as "# General Terms and Conditions" or section header about a different product).
     ### Output
     - Output a JSON object with two fields: "start_line" (the exact text of the start line), and "end_line" (the exact text of the end line; use "" if there is no subsequent section).
-    - If the Watchlist section does not exist, output {{"start_line": "", "end_line": ""}}.
+    - If the Fraud Intelligence section does not exist, output {{"start_line": "", "end_line": ""}}.
 
     DOCUMENT:
     ---
@@ -92,7 +96,7 @@ class Watchlist:
         await asyncio.sleep(1)
 
         response = await self.openai.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-4o-mini",
             temperature=0.0,
             response_format={"type": "json_object"},
             messages=[
@@ -101,15 +105,19 @@ class Watchlist:
             ]
         )
         data = json.loads(response.choices[0].message.content)
-        print(data)
         return data
 
-    async def extract_full_watchlist_chunk_by_llm(self, full_text):
-        boundaries = await self.call_llm_for_watchlist_boundaries(full_text)
+    async def extract_full_fraud_chunk_by_llm(self, full_text):
+        """
+        Uses GPT-4o boundary finder to return the Fraud Intelligence chunk text (or "" if not found).
+        """
+        boundaries = await self.call_llm_for_fraud_boundaries(full_text)
         start_line = boundaries.get("start_line", "").strip()
         end_line = boundaries.get("end_line", "").strip()
+
         if not start_line:
-            return ""
+            return ""  # No block found
+
         lines = full_text.splitlines()
         try:
             start_idx = next(i for i, line in enumerate(lines) if line.strip() == start_line)
@@ -125,37 +133,35 @@ class Watchlist:
         else:
             end_idx = len(lines)
         chunk = "\n".join(lines[start_idx:end_idx]).strip()
-        print(chunk)
         return chunk
-    
-    async def extract_watchlist_consumption_from_llm(self, watchlist_chunk):
-        outputs = []
-        if watchlist_chunk.strip():
-            try:
-                # Add delay before API call
-                await asyncio.sleep(1)
 
+    # ========= EXTRACTION LOGIC =============
+
+    async def extract_fraud_consumption_from_llm(self, fraud_chunk):
+        outputs = []
+        if fraud_chunk.strip():
+            try:
                 response = await self.openai.chat.completions.create(
                     model="gpt-4.1-mini",
                     temperature=0.0,
                     response_format={"type": "json_object"},
                     messages=[
-                        {"role": "system", "content": self.WATCHLIST_INSTRUCTION},
-                        {"role": "user", "content": watchlist_chunk}
+                        {"role": "system", "content": self.FRAUD_INTELLIGENCE_INSTRUCTION},
+                        {"role": "user", "content": fraud_chunk}
                     ]
                 )
                 outputs.append(json.loads(response.choices[0].message.content.strip()))
             except Exception as e:
-                print(f"Error processing Watchlist chunk: {e}")
+                print(f"Error processing FRAUD chunk: {e}")
         else:
-            print("No Watchlist chunk found.")
-        print(outputs)
+            print("No Fraud Intelligence chunk found.")
         return outputs
-    
+
     def transform_to_flat_records(self, outputs):
         subscriptions = []
         sub_cs = []
         sub_cr = []
+
         for doc in outputs:
             if "subscription" in doc:
                 for idx, subscription in enumerate(doc["subscription"], 1):
@@ -170,6 +176,7 @@ class Watchlist:
                         "Note": subscription.get("Note", "")
                     }
                     subscriptions.append(sub_flat)
+                    # SUB CONSUMPTION SCHEDULE
                     sub_cs_flat = {
                         "subCsExternalId": subscription.get("subCsExternalId", ""),
                         "subExternalId": subscription.get("subExternalId", ""),
@@ -180,6 +187,7 @@ class Watchlist:
                         "Type__c": "Range"
                     }
                     sub_cs.append(sub_cs_flat)
+                    # SUB CONSUMPTION RATE
                     for i, scr in enumerate(subscription.get("scr", []), 1):
                         sub_cr_flat = {
                             "subCrExternalId": scr.get("subCrExternalId", ""),
@@ -188,16 +196,18 @@ class Watchlist:
                             "subscriptionName": subscription.get("ProductName", ""),
                             "CurrencyIsoCode": scr.get("CurrencyIsoCode", ""),
                             "Price__c": scr.get("Price__c", ""),
-                            "LowerBound__c": scr.get("LowerBound__c", ""), 
-                            "UpperBound__c": scr.get("UpperBound__c", ""), 
+                            "LowerBound__c": scr.get("LowerBound__c", ""),
+                            "UpperBound__c": scr.get("UpperBound__c", ""),
                         }
                         sub_cr.append(sub_cr_flat)
+
+        # Format as requested
         return [
             {"name": "Subscription", "data": subscriptions},
             {"name": "subConsumptionSchedule", "data": sub_cs},
             {"name": "subConsumptionRate", "data": sub_cr}
         ]
-    
+
     def merge_into_contract_json(self, contract_json, extracted_output):
         section_map = {rec["name"]: rec for rec in contract_json.get("output_records", [])}
         for section in extracted_output:
@@ -211,70 +221,64 @@ class Watchlist:
                     "data": section_data
                 })
         return contract_json
-    
+
     async def main(self, parsed_input, output_all_json):
-        if not isinstance(output_all_json, dict):
-            raise TypeError("contract_json must be a Python dict (not a file path).")
-        # Use markdown_text directly:
-        full_text = parsed_input
+        # 1. Read contract info
+    
         contract_data = output_all_json["output_records"][0]["data"][0]
         contractExternalId = contract_data.get("ContractExternalId", "")
         ContractName = contract_data.get("AccountName", "")
         StartDate = contract_data.get("StartDate", "")
-        # 1. LLM boundary chunk
-        watchlist_chunk = await self.extract_full_watchlist_chunk_by_llm(full_text)
-        # 2. LLM extract
-        outputs = await self.extract_watchlist_consumption_from_llm(watchlist_chunk)
-        # 3. Batch Salesforce lookup
-        all_names = []
-        for doc in outputs:
-            if "subscription" in doc:
-                for subscription in doc["subscription"]:
-                    name = subscription.get("ProductName", "")
-                    if name:
-                        all_names.append(name)
-        all_names = list(set(all_names))
-        product_id_map = {}
-        note_map = {}
-        if all_names:
-            try:
-                sf = Salesforce(
-                    username=self.username,
-                    password=self.password,
-                    security_token=self.security_token,
-                    domain=self.domain
-                )
-                soql_names = ", ".join(["'%s'" % name.replace("'", r"\'") for name in all_names])
-                soql = f"SELECT Id, Name FROM Product2 WHERE Name IN ({soql_names}) AND IsActive = true"
-                res = sf.query(soql)
-                for record in res["records"]:
-                    product_id_map[record["Name"]] = record["Id"]
-                    note_map[record["Name"]] = "Successfully Matched"
-                for name in all_names:
-                    if name not in product_id_map:
-                        product_id_map[name] = None
-                        note_map[name] = "Product not found"
-            except Exception as e:
-                for name in all_names:
-                    product_id_map[name] = None
-                    note_map[name] = "Could not extract ProductId from Salesforce"
+
+        # 2. Read extracted markdown file
+        full_text = parsed_input 
+
+        # 3. Extract the Fraud chunk
+        fraud_chunk = await self.extract_full_fraud_chunk_by_llm(full_text)
+        # 4. Get LLM extraction
+        outputs = await self.extract_fraud_consumption_from_llm(fraud_chunk)
+        # 5. Hardcoded Salesforce query for 'Fraud Intelligence - Person Fraud'
+        fraud_product_id = None
+        note = "Product not found"
+        try:
+            sf = Salesforce(
+                username=self.username,
+                password=self.password,
+                security_token=self.security_token,
+                domain=self.domain
+            )
+            query = "SELECT Id FROM Product2 WHERE Name = 'Fraud Intelligence - Person Fraud' AND IsActive = true"
+            res = sf.query(query)
+            if res["totalSize"] > 0:
+                fraud_product_id = res["records"][0]["Id"]
+                note = "Successfully Matched"
+            else:
+                fraud_product_id = None
+                note = "Product not found"
+        except Exception as e:
+            print(f"Salesforce Query Exception: {e}")
+            fraud_product_id = None
+            note = "Could not extract ProductId from Salesforce"
+
+        # 6. Add custom fields to ALL subscriptions
         sub_count = 1
         for doc in outputs:
             if "subscription" in doc:
                 for subscription in doc["subscription"]:
-                    name = subscription.get("ProductName", "")
-                    subscription["subExternalId"] = f"watchlist_sub_{sub_count}_{contractExternalId}"
+                    subscription["subExternalId"] = f"fraud_sub_{sub_count}_{contractExternalId}"
                     subscription["ContractExternalId"] = contractExternalId
                     subscription["ContractName"] = ContractName
                     subscription["SBQQ__SubscriptionStartDate__c"] = StartDate
-                    subscription["subCsExternalId"] = f"watchlist_subcs_{sub_count}_{contractExternalId}"
-                    subscription["ProductId"] = product_id_map.get(name)
-                    subscription["Note"] = note_map.get(name)
+                    subscription["subCsExternalId"] = f"fraud_subcs_{sub_count}_{contractExternalId}"
+                    subscription["ProductId"] = fraud_product_id      # <--- use the single looked-up value
+                    subscription["Note"] = note                      # <--- use the single looked-up value
                     if "scr" in subscription:
                         for i, scr in enumerate(subscription["scr"], 1):
-                            scr["subCrExternalId"] = f"watchlist_subcr{sub_count}_{i}_{contractExternalId}"
+                            scr["subCrExternalId"] = f"fraud_subcr{sub_count}_{i}_{contractExternalId}"
                     sub_count += 1
-        # 5. Output format and merge
+
+        # 7. Transform to requested output structure
         transformed = self.transform_to_flat_records(outputs)
+        # 8. Merge extracted data into contract_json
         merged = self.merge_into_contract_json(output_all_json, transformed)
         return merged

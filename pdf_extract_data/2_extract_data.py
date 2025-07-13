@@ -8,6 +8,9 @@ from contract_extractor import ContractExtractor
 from salesforce import SalesForce
 from docv import DocV
 from watchlist import Watchlist
+from fraud import Fraud
+from workflow import Wflow
+from validation import Validation
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,9 @@ async def extract_data(event, context):  # Make this async
         sf = SalesForce()
         doc_v = DocV()
         watchlist = Watchlist()
+        fraud = Fraud()
+        Workflow = Wflow()
+        validation = Validation()
 
 
         # Extract the parsed bucket and key from s3://bucket/key format
@@ -47,6 +53,8 @@ async def extract_data(event, context):  # Make this async
         response = s3_client.get_object(Bucket=bucket, Key=key)
         parsed_content = response['Body'].read().decode('utf-8')
 
+        print(f"Parsed content from stage 2: {parsed_content}")
+
         # Delete the file after successful retrieval
         s3_client.delete_object(Bucket=bucket, Key=key)        
 
@@ -55,23 +63,70 @@ async def extract_data(event, context):  # Make this async
         # Process the PDF
         start_time = time.time()
         # If any of these also have async methods, add await
-        all_json = await extractor.extract_contract_pipeline(  # Add await if needed
-            input_pdf=pdf_content,
-            extracted_text=parsed_content,
-            file_name=file_name
-        )
+        try:
+            print("STEP: ContractSubscription")
+            all_json = await extractor.extract_contract_pipeline_from_md(  # Add await if needed
+                input_pdf=pdf_content,
+                extracted_text=parsed_content,
+                file_name=file_name
+            )
+        except Exception as e:
+            print(f"ERROR in ContractSubscription step: {e}")
+            raise
 
-        output_all_json = sf.main(data=all_json)  # Add await if needed
+        try:
+            print("STEP: SalesforceEnrichment")
+            output_all_json = sf.main(data=all_json)  # Add await if needed
+        except Exception as e:
+            print(f"ERROR in SalesforceEnrichment step: {e}")
+            raise
         
-        docv_all_json = doc_v.main(  # Add await if needed
-            parsed_input=parsed_content,
-            output_all_json=output_all_json
-        )
+        try:
+            print("STEP: DOCV")
+            docv_all_json = await doc_v.main(  # Add await if needed
+                parsed_input=parsed_content,
+                output_all_json=output_all_json
+            )
+        except Exception as e:
+            print(f"ERROR in DOCV step: {e}")
+            raise
         
-        watchlist_all_json = watchlist.main(  # Add await if needed
-            parsed_input=parsed_content,
-            output_all_json=docv_all_json
-        )
+        try:
+            print("STEP: Watchlist")
+            watchlist_all_json = await watchlist.main(  # Add await if needed
+                parsed_input=parsed_content,
+                output_all_json=docv_all_json
+            )
+        except Exception as e:
+            print(f"ERROR in Watchlist step: {e}")
+            raise
+
+        try:
+            print("STEP: FraudIntelligence")
+            fraud_all_json = await fraud.main(  # Add await if needed
+                parsed_input=parsed_content,
+                output_all_json=watchlist_all_json
+            )
+        except Exception as e:
+            print(f"ERROR in FraudIntelligence step: {e}")
+            raise
+
+        try:
+            print("STEP: WorkflowStudio")
+            workflow_all_json = await Workflow.main(  # Add await if needed
+                parsed_input=parsed_content,
+                output_all_json=fraud_all_json
+            )
+        except Exception as e:
+            print(f"ERROR in WorkflowStudio step: {e}")
+            raise
+
+        try:
+            print("STEP: Validation")
+            final_json = validation.run_validation(pdf_content, workflow_all_json)
+        except Exception as e:
+            print(f"ERROR in Validation step: {e}")
+            raise
         
         processing_time = time.time() - start_time
 
@@ -81,7 +136,7 @@ async def extract_data(event, context):  # Make this async
         s3_client.put_object(
             Bucket=bucket_name,
             Key=result_key,
-            Body=json.dumps(watchlist_all_json, indent=2),
+            Body=json.dumps(final_json, indent=2),
             ContentType='application/json'
         )
 

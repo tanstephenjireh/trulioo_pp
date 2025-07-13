@@ -4,3 +4,5 @@ pandas
 pdfminer.six
 simple_salesforce
 pdfplumber
+gspread
+oauth2client

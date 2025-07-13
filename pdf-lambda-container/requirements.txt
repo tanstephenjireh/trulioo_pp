@@ -1,3 +1,9 @@
+# boto3
+# pdf2image
+# pillow
+# openai
+# pdfminer.six
+# simple_salesforce
 boto3
 PyMuPDF
 pillow

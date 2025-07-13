@@ -32,7 +32,10 @@ async def process_pdf(event, context):  # Make this async
         
         # Process the PDF
         start_time = time.time()
-        parsed_content = await pdf_parser.parse_pdf_from_s3(pdf_content)  # Add await
+        # parsed_content = await pdf_parser.parse_pdf_from_s3(pdf_content)  # Add await
+        parsed_content = await pdf_parser.parse_pdf(pdf_content)
+        print(f"Parsed content from stage 1: {parsed_content}")
+
         
         processing_time = time.time() - start_time
 
