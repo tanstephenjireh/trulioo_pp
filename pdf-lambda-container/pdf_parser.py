@@ -15,7 +15,16 @@ logger = logging.getLogger(__name__)
 class PDFParser:
     def __init__(self):
         self.OPENAI_API_KEY = get_ssm_param("/myapp/openai_api_key")
-        self.PARSER_PROMPT = get_ssm_param("/myapp/parser_prompt")
+        # self.PARSER_PROMPT = get_ssm_param("/myapp/parser_prompt")
+
+        self.PARSER_PROMPT = """Analyze the text in the provided image. Extract all readable content
+                        and present it in a structured Markdown format that is clear, concise,
+                        and well-organized. Ensure proper formatting (e.g., headings, lists, or
+                        code blocks) as necessary to represent the content effectively. Ensure
+                        verbatim extraction.
+
+                        Do not include the Appendix sections in the extraction. Basically, extract all except for the appendix sections.
+                        """
 
     def encode_image(self, image_bytes):
         """Encode image bytes to base64"""
@@ -26,7 +35,7 @@ class PDFParser:
         client = AsyncOpenAI(api_key=self.OPENAI_API_KEY)
         try:
             # Add delay before API call
-            await asyncio.sleep(1)
+            await asyncio.sleep(5)
             response = await client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
@@ -50,12 +59,12 @@ class PDFParser:
             return f"Error processing image: {str(e)}"
         
     def extract_appendix_locs(self, pages):
-        pattern = re.compile(r'appendix 1: business verification country groupings', re.IGNORECASE)
+        pattern = re.compile(r'appendix(?: 1)?: business verification country groupings', re.IGNORECASE)
         start_index = next((i for i, item in enumerate(pages) if pattern.search(item)), None)
         result = list(range(start_index, len(pages))) if start_index is not None else []
         return result
 
-    async def parse_pdf_from_s3(self, pdf_content) -> str:
+    async def parse_pdf(self, pdf_content) -> str:
         logger.info("Starting PDF parsing from S3 content")
         
         # Extract text first

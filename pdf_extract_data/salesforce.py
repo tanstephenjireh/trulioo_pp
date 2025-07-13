@@ -2,6 +2,10 @@ from simple_salesforce import Salesforce
 from config import get_ssm_param
 import logging
 
+import gspread  # pip install gspread oauth2client
+from oauth2client.service_account import ServiceAccountCredentials
+import pandas as pd
+
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -13,6 +17,51 @@ class SalesForce:
         self.password = get_ssm_param("/myapp/sf_password")
         self.security_token = get_ssm_param("/myapp/sf_security_token")
         self.domain = get_ssm_param("/myapp/sf_domain")
+        self.gs_url = 'https://docs.google.com/spreadsheets/d/1uDA-59DhXE5rld3UBawrLb5iERNsLL8Nyd8kweSuqaw/edit?gid=309153661#gid=309153661'
+        self.creds_path = 'trulioo-af66af3a3788.json'
+
+    def update_subscription_names_from_country(self, subscriptions, country_map):
+        """
+        For each item in subscriptions, if ProductName matches a key in country_map, replace it with the mapped value.
+        Prints a message to the terminal for each replacement.
+        """
+
+        for item in subscriptions:
+            pname = item.get('ProductName')
+            if pname in country_map:
+                print(f"[Country Mapping] ProductName replaced: '{pname}' -> '{country_map[pname]}'")
+                item['ProductName'] = country_map[pname]
+                item['Note_country_mapping'] = f"ProductName replaced from '{pname}' to '{country_map[pname]}' via country sheet."
+
+    def get_gsheet_dataframes(self, spreadsheet_url, creds_json_path):
+        """
+        Connects to a Google Sheet and returns a dict of {sheet_name: DataFrame}.
+        Args:
+            spreadsheet_url (str): The URL of the Google Sheet.
+            creds_json_path (str): Path to your Google Service Account credentials JSON file.
+        Returns:
+            dict: {sheet_name: pd.DataFrame}
+        """
+        scope = [
+            'https://spreadsheets.google.com/feeds',
+            'https://www.googleapis.com/auth/drive',
+        ]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(creds_json_path, scope)  # type: ignore
+        client = gspread.authorize(creds)  
+        
+        spreadsheet = client.open_by_url(spreadsheet_url)
+        
+        # Fetch all worksheets
+        dataframes = {}
+        for worksheet in spreadsheet.worksheets():
+            # Get all values as a list of lists
+            data = worksheet.get_all_values()
+            if data:
+                # First row is header, ensure columns are str and use pd.Index for type safety
+                columns = pd.Index([str(col) for col in data[0]])
+                df = pd.DataFrame(data[1:], columns=columns)  # type: ignore
+                dataframes[worksheet.title] = df
+        return dataframes
 
     def get_all_records(self, json_data, name):
         for group in json_data.get("output_records", []):
@@ -126,7 +175,7 @@ class SalesForce:
                 item['Component_Charge_Name__c'] = record.get('Component_Charge_Name__c')
                 item['OwnerId'] = record.get('OwnerId')
                 item['Note'] = "Duplicate Line Item Source Names found, Id was taken from latest CreatedDate" if len(records) > 1 else "Successfully Matched"
-                
+
     #======Functions for Sub Conscumption Schedule========
     def fetch_product_consumption_schedules(self, sf, product_ids, batch_size=100):
         if not product_ids:
@@ -222,22 +271,55 @@ class SalesForce:
 
     #========MAIN PIPE==========
     def main(self, data):
-        # data = load_json(input_json_path)
+        """
+        Accepts the contract_subscription output as a dict, mutates it with Salesforce enrichment, and returns the result as a dict.
+        """
         sf = Salesforce(
-            username=self.username,
-            password=self.password,
-            security_token=self.security_token,
-            domain=self.domain
+            username='consulting+trulioo@jumpr.io.trulioopsb',
+            password='HPW@zfm0afv1hup5amh',
+            security_token='8M87y8MwxarZ7xt1SPHsLhsG',
+            domain='test'
         )
+
+        dfs = self.get_gsheet_dataframes(self.gs_url, self.creds_path)
+
+        country_df = dfs.get('country')
+        country_map = {}
+        if country_df is not None and country_df.shape[1] >= 2:
+            # Build mapping from column A to column B
+            country_map = dict(zip(country_df.iloc[:, 0], country_df.iloc[:, 1]))
 
         # --- SUBSCRIPTIONS ---
         subscriptions = self.get_all_records(data, "Subscription")
+        self.update_subscription_names_from_country(subscriptions, country_map)
         product_names = self.get_unique_product_names(subscriptions)
         product_field_map = self.fetch_product2_fields(sf, product_names)
         subext_to_pid = self.update_subscription_product_fields(subscriptions, product_field_map)
 
         # --- LINE ITEM SOURCES ---
         lineitems = self.get_all_records(data, "LineItemSource")
+        # --- SKU sheet mapping logic for lisName update ---
+        sku_df = dfs.get('SKU')
+        if sku_df is not None and sku_df.shape[1] >= 4:
+            # Build a list of tuples for fast lookup: (ProductName, lisName) -> new_lisName
+            sku_map = {}
+            for idx, row in sku_df.iterrows():
+                pname = row.iloc[0]
+                old_lis = row.iloc[1]
+                new_lis = row.iloc[3]
+                sku_map[(pname, old_lis)] = new_lis
+            # Update lisName in lineitems if both ProductName and lisName match
+            for item in lineitems:
+                parent_pid = subext_to_pid.get(item.get("subExternalId"))
+                # Find the parent ProductName from subscriptions
+                parent_sub = next((s for s in subscriptions if s.get("subExternalId") == item.get("subExternalId")), None)
+                parent_pname = parent_sub.get("ProductName") if parent_sub else None
+                lis_name = item.get("lisName")
+                if parent_pname and lis_name and (parent_pname, lis_name) in sku_map:
+                    old_lis = item["lisName"]
+                    item["lisName"] = sku_map[(parent_pname, lis_name)]
+                    item["Note_SKU_mapping"] = f"lisName replaced from '{old_lis}' to '{item['lisName']}' via SKU sheet."
+                    print(f"[SKU Mapping] lisName replaced for ProductName '{parent_pname}': '{old_lis}' -> '{item['lisName']}'")
         keymap = self.get_lineitem_keys(lineitems, subext_to_pid)
         option_pid_map = self.fetch_option_product_ids(sf, keymap)
         self.update_lineitem_product_ids(lineitems, keymap, option_pid_map)
@@ -266,10 +348,10 @@ class SalesForce:
         data["ExtractedSubCnt"] = len(subscriptions)
         data["ExtractedLisCnt"] = len(lineitems)
         data["MatchedSubCnt"] = sum(
-        1 for item in subscriptions if (
-            item.get("Note") == "Successfully Matched" or
-            item.get("Note") == "Duplicate Subscription Names found, Id was taken from latest CreatedDate"
-        )
+            1 for item in subscriptions if (
+                item.get("Note") == "Successfully Matched" or
+                item.get("Note") == "Duplicate Subscription Names found, Id was taken from latest CreatedDate"
+            )
         )
         data["MatchedLisCnt"] = sum(
             1 for item in lineitems if (
@@ -280,7 +362,20 @@ class SalesForce:
         # --- ACCURACY RATE -----
         data["% Sub Matching Rate"] = f"{(data['MatchedSubCnt'] / data['ExtractedSubCnt'] * 100):.2f}%" if data['ExtractedSubCnt'] else ""
         data["% LIS Matching Rate"] = f"{(data['MatchedLisCnt'] / data['ExtractedLisCnt'] * 100):.2f}%" if data['ExtractedLisCnt'] else ""
-        data["% Sub Extraction Rate"] = f"{(data['ExtractedSubCnt'] / data['ActualSubCnt'] * 100):.2f}%" if data.get('ActualSubCnt') else ""
-        data["% LIS Extraction Rate"] = f"{(data['ExtractedLisCnt'] / data['ActualLisCnt'] * 100):.2f}%" if data.get('ActualLisCnt') else ""
 
+        # --- 07/09: NA logic for confidence scores ---
+        if data.get('ActualSubCnt', 0) == 0 and data.get('ExtractedSubCnt', 0) == 0:
+            data["% Sub Extraction Confidence Score"] = "NA"
+        elif data.get('ActualSubCnt') or data.get('ExtractedSubCnt'):
+            data["% Sub Extraction Confidence Score"] = f"{(1 - abs(data['ExtractedSubCnt'] - data['ActualSubCnt']) / max(data['ExtractedSubCnt'], data['ActualSubCnt'], 1)) * 100:.2f}%"
+        else:
+            data["% Sub Extraction Confidence Score"] = ""
+
+        if data.get('ActualLisCnt', 0) == 0 and data.get('ExtractedLisCnt', 0) == 0:
+            data["% LIS Extraction Confidence Score"] = "NA"
+        elif data.get('ActualLisCnt'):
+            data["% LIS Extraction Confidence Score"] = f"{(1 - abs(data['ExtractedLisCnt'] - data['ActualLisCnt']) / max(data['ActualLisCnt'], 1)) * 100:.2f}%"
+        else:
+            data["% LIS Extraction Confidence Score"] = "NA"
+        print(f"conf score: {data['ActualSubCnt']}")
         return data

@@ -1,7 +1,8 @@
 import re
 import json
 import logging
-from openai import OpenAI
+import asyncio
+from openai import AsyncOpenAI
 from config import get_ssm_param
 from simple_salesforce import Salesforce
 
@@ -13,59 +14,151 @@ class Watchlist:
     def __init__(self):
         # ========== ENV SETUP ==========
         self.OPENAI_API_KEY = get_ssm_param("/myapp/openai_api_key")
-        self.WATCHLIST_INSTRUCTION = get_ssm_param("/myapp/watchlist_prompt")
-        self.openai = OpenAI(api_key=self.OPENAI_API_KEY)
+        # self.WATCHLIST_INSTRUCTION = get_ssm_param("/myapp/watchlist_prompt")
+        self.openai = AsyncOpenAI(api_key=self.OPENAI_API_KEY)
 
         self.username = get_ssm_param("/myapp/sf_username")
         self.password = get_ssm_param("/myapp/sf_password")
         self.security_token = get_ssm_param("/myapp/sf_security_token")
         self.domain = get_ssm_param("/myapp/sf_domain")
 
-    def extract_full_watchlist_chunk(self, full_text):
+        self.WATCHLIST_INSTRUCTION = """
+        You are an intelligent field extractor. You are given a chunk of a document that may contain two relevant sections:
+            1. Selected Services and Pricing: Watchlist
+            2. Watchlist Tier Pricing
+        If a value is not present or no chunk was provided, return "NA". Do not leave any field blank.
+
+        ## `subscription` (subscription level fields).
+        Do this for each Name. One Name is one Subscription. 
+        From Section: Selected Services and Pricing: Watchlist
+            - `ProductName`: Extract the Name listed in this section. 
+            - `CurrencyIsoCode`: get the ISO currency code from the “Price Per Query” column or From Section: Watchlist Tier Pricing whicever is the price of the Name. 
+                - If "$", it is automatically USD. 
+                - NA if there is no price.
+                
+        ##  `scr` (subscription consumption rate for this subscription)      
+        For the Item Name above, find the corresponding prices. It may be dependent on tier pricing table under Watchlist Tier Pricing: .
+            - `subCrName`: The name or identifier of the price. 
+                - Assigned "<Name> Consumption Rate" if the price is not tiered.
+                - Assigned "<Name Tier <<n>> Consumption Rate" if the price is tiered.
+            - `LowerBound__c`: The monthly volume lower bound for tiered. "1" if none.
+            - `UpperBound__c`: The monthly volume upper bound for tiered. NA if none.
+            - `Price__c`: The value`: 
+                - from the "Price per Query" column for tiered, 
+                - from the "Fee per Qeuery" if non tiered.
+                - extract only the value without the currency.
+            - `CurrencyIsoCode`: get the ISO currency code from the “Price Per Query” column or From Section: Watchlist Tier Pricing whicever is the price of the Name. 
+                - If "$", it is automatically USD. 
+                - NA if there is no price.
+            
+        Return the extracted data as a structured JSON object, formatted as follows:
+        ```json
+        {
+        "subscription": [
+            {
+            <Subscription1-level fields>,
+            "scr": [ ...subscription consumption rate for this subscription... ]
+            },
+            {
+            <Subscription2-level fields>,
+            "scr": [ ...subscription consumption rate for this subscription... ]
+            },
+        ]
+        }
+        ```
+
         """
-        Extracts the entire Watchlist block—starting from the first
-        markdown header containing 'Watchlist' (e.g. '# ...Watchlist...')
-        until the end of the input text.
-        Returns a single string to pass to the LLM.
+
+    async def call_llm_for_watchlist_boundaries(self, full_text):
+        system_prompt = (
+            "You are an expert contract parser. "
+            "Your job is to find the exact line text that marks the START and END of the Watchlist section in the contract below."
+        )
+        user_prompt = f"""
+    # Instructions:
+    ### START OF WATCHLIST ###
+    - Find the line that marks the START of the Watchlist block. This may be a header containing ' # Selected Services and Pricing: Watchlist' (or similar such as "# Selected Services & Pricing: Watchlist". There may be slight naming variations such as but not limited to spacing and ampersand). 
+        - A Watchlist block may also be associated with a section '# Watchlist Tier Pricing'
+    - The END of the Watchlist block is the first line AFTER the Watchlist section that is clearly a new section (such as another "# ..." section header about a different product, e.g. '# Selected Services and Pricing: Identity Document Verification', '# Selected Services and Pricing: Workflow Studio', etc.), or the end of the document if nothing follows.
+    ### Output
+    - Output a JSON object with two fields: "start_line" (the exact text of the start line), and "end_line" (the exact text of the end line; use "" if there is no subsequent section).
+    - If the Watchlist section does not exist, output {{"start_line": "", "end_line": ""}}.
+
+    DOCUMENT:
+    ---
+    {full_text}
         """
-        # Match any markdown header (e.g. '#', '##', '###', etc.) with 'Watchlist' in it
-        header_regex = r"^#{1,6}\s.*watchlist.*$"
-        match = re.search(header_regex, full_text, re.IGNORECASE | re.MULTILINE)
-        if not match:
+        # Add delay before API call
+        await asyncio.sleep(1)
+
+        response = await self.openai.chat.completions.create(
+            model="gpt-4.1-mini",
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        data = json.loads(response.choices[0].message.content)
+        print(data)
+        return data
+
+    async def extract_full_watchlist_chunk_by_llm(self, full_text):
+        boundaries = await self.call_llm_for_watchlist_boundaries(full_text)
+        start_line = boundaries.get("start_line", "").strip()
+        end_line = boundaries.get("end_line", "").strip()
+        if not start_line:
             return ""
-        start = match.start()
-        chunk = full_text[start:].strip()
+        lines = full_text.splitlines()
+        try:
+            start_idx = next(i for i, line in enumerate(lines) if line.strip() == start_line)
+        except StopIteration:
+            print(f"Start line not found: {start_line}")
+            return ""
+        if end_line:
+            try:
+                end_idx = next(i for i, line in enumerate(lines) if line.strip() == end_line)
+            except StopIteration:
+                print(f"End line not found: {end_line}. Using end of document.")
+                end_idx = len(lines)
+        else:
+            end_idx = len(lines)
+        chunk = "\n".join(lines[start_idx:end_idx]).strip()
+        print(chunk)
         return chunk
     
-    def extract_watchlist_consumption_from_llm(self, docv_chunk):
+    async def extract_watchlist_consumption_from_llm(self, watchlist_chunk):
         outputs = []
-        if docv_chunk.strip():
+        if watchlist_chunk.strip():
             try:
-                response = self.openai.chat.completions.create(
-                    model="gpt-4.1",
+                # Add delay before API call
+                await asyncio.sleep(1)
+
+                response = await self.openai.chat.completions.create(
+                    model="gpt-4.1-mini",
                     temperature=0.0,
                     response_format={"type": "json_object"},
                     messages=[
                         {"role": "system", "content": self.WATCHLIST_INSTRUCTION},
-                        {"role": "user", "content": docv_chunk}
+                        {"role": "user", "content": watchlist_chunk}
                     ]
                 )
                 outputs.append(json.loads(response.choices[0].message.content.strip()))
             except Exception as e:
-                print(f"Error processing DOCV chunk: {e}")
+                print(f"Error processing Watchlist chunk: {e}")
         else:
             print("No Watchlist chunk found.")
+        print(outputs)
         return outputs
     
     def transform_to_flat_records(self, outputs):
         subscriptions = []
         sub_cs = []
         sub_cr = []
-
         for doc in outputs:
             if "subscription" in doc:
                 for idx, subscription in enumerate(doc["subscription"], 1):
-                    # Make sure these fields are included!
                     sub_flat = {
                         "subExternalId": subscription.get("subExternalId", ""),
                         "ProductName": subscription.get("ProductName", ""),
@@ -77,8 +170,6 @@ class Watchlist:
                         "Note": subscription.get("Note", "")
                     }
                     subscriptions.append(sub_flat)
-
-                    # SUB CONSUMPTION SCHEDULE (one per subscription)
                     sub_cs_flat = {
                         "subCsExternalId": subscription.get("subCsExternalId", ""),
                         "subExternalId": subscription.get("subExternalId", ""),
@@ -89,8 +180,6 @@ class Watchlist:
                         "Type__c": "Range"
                     }
                     sub_cs.append(sub_cs_flat)
-
-                    # SUB CONSUMPTION RATE (from SCR)
                     for i, scr in enumerate(subscription.get("scr", []), 1):
                         sub_cr_flat = {
                             "subCrExternalId": scr.get("subCrExternalId", ""),
@@ -99,12 +188,10 @@ class Watchlist:
                             "subscriptionName": subscription.get("ProductName", ""),
                             "CurrencyIsoCode": scr.get("CurrencyIsoCode", ""),
                             "Price__c": scr.get("Price__c", ""),
-                            "LowerBound__c": scr.get("LowerBound__c", ""),
-                            "UpperBound__c": scr.get("UpperBound__c", ""),
+                            "LowerBound__c": scr.get("LowerBound__c", ""), 
+                            "UpperBound__c": scr.get("UpperBound__c", ""), 
                         }
                         sub_cr.append(sub_cr_flat)
-
-        # Format as requested
         return [
             {"name": "Subscription", "data": subscriptions},
             {"name": "subConsumptionSchedule", "data": sub_cs},
@@ -113,36 +200,32 @@ class Watchlist:
     
     def merge_into_contract_json(self, contract_json, extracted_output):
         section_map = {rec["name"]: rec for rec in contract_json.get("output_records", [])}
-
         for section in extracted_output:
             section_name = section["name"]
             section_data = section["data"]
             if section_name in section_map:
                 section_map[section_name]["data"].extend(section_data)
             else:
-                # Add new section if not present
                 contract_json["output_records"].append({
                     "name": section_name,
                     "data": section_data
                 })
-
         return contract_json
     
-    def main(self, parsed_input, output_all_json):
-        # 1. Read contract info
-
+    async def main(self, parsed_input, output_all_json):
+        if not isinstance(output_all_json, dict):
+            raise TypeError("contract_json must be a Python dict (not a file path).")
+        # Use markdown_text directly:
+        full_text = parsed_input
         contract_data = output_all_json["output_records"][0]["data"][0]
         contractExternalId = contract_data.get("ContractExternalId", "")
         ContractName = contract_data.get("AccountName", "")
         StartDate = contract_data.get("StartDate", "")
-
-        # 3. Extract the Watchlist chunk
-        docv_chunk = self.extract_full_watchlist_chunk(parsed_input)
-
-        # 4. Get LLM extraction
-        outputs = self.extract_watchlist_consumption_from_llm(docv_chunk)
-
-        # 5. Collect all unique ProductNames for batch lookup
+        # 1. LLM boundary chunk
+        watchlist_chunk = await self.extract_full_watchlist_chunk_by_llm(full_text)
+        # 2. LLM extract
+        outputs = await self.extract_watchlist_consumption_from_llm(watchlist_chunk)
+        # 3. Batch Salesforce lookup
         all_names = []
         for doc in outputs:
             if "subscription" in doc:
@@ -150,9 +233,7 @@ class Watchlist:
                     name = subscription.get("ProductName", "")
                     if name:
                         all_names.append(name)
-        all_names = list(set(all_names))  # unique
-
-        # 6. Batch query Salesforce for these names
+        all_names = list(set(all_names))
         product_id_map = {}
         note_map = {}
         if all_names:
@@ -177,11 +258,6 @@ class Watchlist:
                 for name in all_names:
                     product_id_map[name] = None
                     note_map[name] = "Could not extract ProductId from Salesforce"
-        else:
-            product_id_map = {}
-            note_map = {}
-
-        # 7. Add custom fields (these will ALWAYS be present)
         sub_count = 1
         for doc in outputs:
             if "subscription" in doc:
@@ -198,11 +274,7 @@ class Watchlist:
                         for i, scr in enumerate(subscription["scr"], 1):
                             scr["subCrExternalId"] = f"watchlist_subcr{sub_count}_{i}_{contractExternalId}"
                     sub_count += 1
-
-        # 8. Transform to requested output structure
+        # 5. Output format and merge
         transformed = self.transform_to_flat_records(outputs)
-
-        # 9. Merge extracted data into contract_json
         merged = self.merge_into_contract_json(output_all_json, transformed)
-
-        return merged 
+        return merged

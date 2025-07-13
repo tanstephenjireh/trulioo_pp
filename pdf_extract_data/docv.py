@@ -1,8 +1,9 @@
-import re
 import json
 import logging
-from openai import OpenAI
+import asyncio
+from openai import AsyncOpenAI
 from config import get_ssm_param
+from simple_salesforce import Salesforce
 
 
 # Configure logging
@@ -13,38 +14,136 @@ class DocV:
     def __init__(self):
         # ========== ENV SETUP ==========
         self.OPENAI_API_KEY = get_ssm_param("/myapp/openai_api_key")
-        self.DOCV_INSTRUCTION = get_ssm_param("/myapp/docv_prompt")
-        self.openai = OpenAI(api_key=self.OPENAI_API_KEY)
+        # self.DOCV_INSTRUCTION = get_ssm_param("/myapp/docv_prompt")
+        self.openai = AsyncOpenAI(api_key=self.OPENAI_API_KEY)
 
         self.username = get_ssm_param("/myapp/sf_username")
         self.password = get_ssm_param("/myapp/sf_password")
         self.security_token = get_ssm_param("/myapp/sf_security_token")
         self.domain = get_ssm_param("/myapp/sf_domain")
 
+        self.DOCV_INSTRUCTION = """
+        You are an intelligent field extractor. You are given a chunk of a document that may contain two relevant sections:
+            1. Selected Services and Pricing: Identity Document Verification
+            2. Identity Document Verification - Tier Pricing
+        If a value is not present or no chunk was provided, return "NA". Do not leave any field blank.
+
+        ## `subscription` (subscription level fields)
+        From Section: Selected Services and Pricing: Identity Document Verification
+            - `ProductName`: Extract Item Name listed in this section. There is only one ItemName, under the column Item Name
+        From Section: Identity Document Verification - Tier Pricing
+            - `CurrencyIsoCode`: get the ISO currency code from the “Price Per Query” table. 
+                - If "$", it is automatically USD. 
+
+        ##  `scr` (subscription consumption rate for this subscription)      
+        From Section: Identity Document Verification - Tier Pricing: For the Item Name above, find the corresponding tier pricing table.
+        For each row in the 'Tier Pricing' table, extract:
+            - `subCrName`: The name or identifier of the tier (if present, else "NA").
+            - `LowerBound__c`: The monthly transaction volume lower bound. "1" if none.
+            - `UpperBound__c`: The monthly transaction volume upper bound. 
+            - `Price__c`: The value`: from the "Price per Query" column, extract only the value without the currency.
+            - `CurrencyIsoCode`: the currency under the "Fee per Query" column. If "$", it is automatically USD. 
+            
+        Return the extracted data as a structured JSON object, formatted as follows:
+        ```json
+        {
+        "subscription": [
+            {
+            <Subscription-level fields>,
+            "scr": [ ...subscription consumption rate for this subscription... ]
+            }
+        ]
+        }
+        ```
+
+        """
+
 
     # ========== DOCV EXTRACTION LOGIC ==========
-    def extract_full_docv_chunk(self, full_text):
+    ## New Function ## <delete the old chunking>
+    async def call_llm_for_docv_boundaries(self, full_text):
         """
-        Extracts the entire DOCV block—starting from the first
-        'Selected Services and Pricing: Identity Document Verification'
-        header until the end of the input text.
-        Returns a single string to pass to the LLM.
+        Uses GPT-4o to find the start and end line (as exact line text) of the Identity Document Verification section, usually with a header "# Selected Services & Pricing: Identity Document Verification".
+        Returns a dict: {"start_line": "...", "end_line": "..."} or None if not found.
         """
-        header = r"Selected Services and Pricing: Identity Document Verification"
-        match = re.search(header, full_text, re.IGNORECASE)
-        if not match:
+        system_prompt = (
+            "You are an expert contract parser. "
+            "Your job is to find the exact line text that marks the START and END of the Identity Document Verification section in the contract below."
+        )
+        user_prompt = f"""
+    # Instructions:
+    ### START OF DOC V ###
+    - Find the line that marks the START of the DOCV block. This is the line containing 'Selected Services and Pricing: Identity Document Verification' (match headers like '# Selected Services and Pricing: Identity Document Verification', 'Selected Services and Pricing: Identity Document Verification', etc.).
+        - A DOCV block may also be associated with # Identity Document Verification - Tier Pricing, and # Identity Document Verification Tier Pricing Table sections
+    ### END OF DOCV
+    - Find the line that marks the END of the DOCV block or when the section is no longer about Identity Verficiation or its pricing. 
+        - This is the first line AFTER the DOCV section that is clearly a new section (such as '# Selected Services & Pricing: Business Verification', '# Selected Services and Pricing: Workflow Studio', etc.).
+    ### Output
+    - Output a JSON object with two fields: "start_line" (the exact text of the start line), and "end_line" (the exact text of the end line; use "" if there is no subsequent section).
+    - If the DOCV section does not exist, output {{"start_line": "", "end_line": ""}}.
+
+    DOCUMENT:
+    ---
+    {full_text}
+        """
+        # Add delay before API call
+        await asyncio.sleep(1)
+
+        response = await self.openai.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ]
+        )
+        data = json.loads(response.choices[0].message.content)
+        return data
+    ## --end of new function-- ##
+
+    ## New funcion ##
+    async def extract_full_docv_chunk_by_llm(self, full_text):
+        """
+        Uses GPT-4o-mini boundary finder to return the DOCV chunk text (or "" if not found).
+        """
+        boundaries = await self.call_llm_for_docv_boundaries(full_text)
+        start_line = boundaries.get("start_line", "").strip()
+        end_line = boundaries.get("end_line", "").strip()
+
+        if not start_line:
             return ""  # No DOCV block found
 
-        start = match.start()
-        chunk = full_text[start:].strip()  # Everything from header to end of file
+        # Split document into lines for precise search
+        lines = full_text.splitlines()
+        try:
+            start_idx = next(i for i, line in enumerate(lines) if line.strip() == start_line)
+        except StopIteration:
+            print(f"Start line not found: {start_line}")
+            return ""
+        
+        if end_line:
+            try:
+                end_idx = next(i for i, line in enumerate(lines) if line.strip() == end_line)
+            except StopIteration:
+                print(f"End line not found: {end_line}. Using end of document.")
+                end_idx = len(lines)
+        else:
+            end_idx = len(lines)
+
+        chunk = "\n".join(lines[start_idx:end_idx]).strip()
         return chunk
-    
-    def extract_docv_consumption_from_llm(self, docv_chunk):
+    ## --end of new function-- ##
+
+    async def extract_docv_consumption_from_llm(self, docv_chunk):
         outputs = []
         if docv_chunk.strip():
             try:
-                response = self.openai.chat.completions.create(
-                    model="gpt-4.1",
+                # Add delay before API call
+                await asyncio.sleep(1)
+
+                response = await self.openai.chat.completions.create(
+                    model="gpt-4.1-mini",
                     temperature=0.0,
                     response_format={"type": "json_object"},
                     messages=[
@@ -83,9 +182,9 @@ class DocV:
                     # SUB CONSUMPTION SCHEDULE (one per subscription)
                     sub_cs_flat = {
                         "subCsExternalId": subscription.get("subCsExternalId", ""),
-                        "subCsName": subscription.get("ProductName", "") + " - Direct Consumption Schedule",
                         "subExternalId": subscription.get("subExternalId", ""),
                         "subscriptionName": subscription.get("ProductName", ""),
+                        "subCsName": subscription.get("ProductName", "") + " Direct Consumption Schedule",
                         "CurrencyIsoCode": subscription.get("CurrencyIsoCode", ""),
                         "RatingMethod__c":"Tier",
                         "Type__c": "Range"
@@ -101,8 +200,8 @@ class DocV:
                             "subscriptionName": subscription.get("ProductName", ""),
                             "CurrencyIsoCode": scr.get("CurrencyIsoCode", ""),
                             "Price__c": scr.get("Price__c", ""),
-                            "LowerBound__c": scr.get("LowerBound__c", ""),
-                            "UpperBound__c": scr.get("UpperBound__c", ""),
+                            "LowerBound__c": scr.get("LowerBound__c", ""), 
+                            "UpperBound__c": scr.get("UpperBound__c", ""), 
                         }
                         sub_cr.append(sub_cr_flat)
 
@@ -113,7 +212,6 @@ class DocV:
             {"name": "subConsumptionRate", "data": sub_cr}
         ]
     
-
     def merge_into_contract_json(self, contract_json, extracted_output):
         # Build a map for fast lookup of output_records by 'name'
         section_map = {rec["name"]: rec for rec in contract_json.get("output_records", [])}
@@ -133,14 +231,18 @@ class DocV:
 
         return contract_json
     
-    def main(self, parsed_input, output_all_json):
-        from simple_salesforce import Salesforce
+    async def main(self, parsed_input, output_all_json):
+        if not isinstance(output_all_json, dict):
+            raise TypeError("contract_json must be a Python dict (not a file path).")
 
+        # Use markdown_text directly:
+        full_text = parsed_input 
 
         contract_data = output_all_json["output_records"][0]["data"][0]
         contractExternalId = contract_data.get("ContractExternalId", "")
         ContractName = contract_data.get("AccountName", "")
         StartDate = contract_data.get("StartDate", "")
+
 
         # 2. Try to query Salesforce (and ALWAYS set ProductId and Note)
         try:
@@ -168,13 +270,18 @@ class DocV:
             docv_product_id = None
             note = "Could not extract ProductId from Salesforce"
 
-
+        
+        ## Updated lines
         # 4. Extract the DOCV chunk
-        docv_chunk = self.extract_full_docv_chunk(parsed_input)
+        #docv_chunk = extract_full_docv_chunk(full_text)
+        docv_chunk = await self.extract_full_docv_chunk_by_llm(full_text)
+
 
         # 5. Get LLM extraction
-        outputs = self.extract_docv_consumption_from_llm(docv_chunk)
+        #outputs = extract_docv_consumption_from_llm(docv_chunk)
+        outputs = await self.extract_docv_consumption_from_llm(docv_chunk)
 
+        ## --end of updated lines 
         # 6. Add custom fields (these will ALWAYS be present)
         for doc in outputs:
             if "subscription" in doc:
@@ -196,4 +303,4 @@ class DocV:
         # 8. Merge extracted data into contract_json
         merged = self.merge_into_contract_json(output_all_json, transformed)
 
-        return merged
+        return merged 
