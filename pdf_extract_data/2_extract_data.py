@@ -10,6 +10,7 @@ from docv import DocV
 from watchlist import Watchlist
 from fraud import Fraud
 from workflow import Wflow
+from discount_schedule import DiscountSchedule
 from validation import Validation
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ async def extract_data(event, context):  # Make this async
         watchlist = Watchlist()
         fraud = Fraud()
         Workflow = Wflow()
+        discount_schedule = DiscountSchedule()
         validation = Validation()
 
 
@@ -122,8 +124,15 @@ async def extract_data(event, context):  # Make this async
             raise
 
         try:
+            print("STEP: Discount Schedule")
+            discount_json = await discount_schedule.main(parsed_content, workflow_all_json)
+        except Exception as e:
+            print(f"ERROR in Discount Schedule step: {e}")
+            raise
+
+        try:
             print("STEP: Validation")
-            final_json = validation.run_validation(pdf_content, workflow_all_json)
+            final_json = validation.run_validation(pdf_content, discount_json)
         except Exception as e:
             print(f"ERROR in Validation step: {e}")
             raise

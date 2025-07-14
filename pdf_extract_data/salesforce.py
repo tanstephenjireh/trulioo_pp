@@ -18,7 +18,7 @@ class SalesForce:
         self.security_token = get_ssm_param("/myapp/sf_security_token")
         self.domain = get_ssm_param("/myapp/sf_domain")
         self.gs_url = 'https://docs.google.com/spreadsheets/d/1uDA-59DhXE5rld3UBawrLb5iERNsLL8Nyd8kweSuqaw/edit?gid=309153661#gid=309153661'
-        self.creds_path = 'trulioo-af66af3a3788.json'
+        self.creds_path = 'trulioo-413bdb6f7cd9.json'
 
     def update_subscription_names_from_country(self, subscriptions, country_map):
         """
@@ -275,10 +275,10 @@ class SalesForce:
         Accepts the contract_subscription output as a dict, mutates it with Salesforce enrichment, and returns the result as a dict.
         """
         sf = Salesforce(
-            username='consulting+trulioo@jumpr.io.trulioopsb',
-            password='HPW@zfm0afv1hup5amh',
-            security_token='8M87y8MwxarZ7xt1SPHsLhsG',
-            domain='test'
+            username=self.username,
+            password=self.password,
+            security_token=self.security_token,
+            domain=self.domain
         )
 
         dfs = self.get_gsheet_dataframes(self.gs_url, self.creds_path)
