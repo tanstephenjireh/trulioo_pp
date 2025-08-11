@@ -1,0 +1,8 @@
+boto3==1.38.33
+openai==1.88.0
+pandas==2.3.0
+pdfminer.six==20250506
+simple_salesforce==1.12.6
+pdfplumber==0.11.7
+gspread==6.2.1
+oauth2client==4.1.3
