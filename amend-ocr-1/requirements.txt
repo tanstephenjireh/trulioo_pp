@@ -1,0 +1,5 @@
+boto3==1.38.33
+openai==1.88.0
+pandas==2.3.0
+pillow
+PyMuPDF

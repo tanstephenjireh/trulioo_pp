@@ -130,8 +130,14 @@ class SalesForce:
         for item in lineitems:
             parent_pid = subext_to_pid.get(item.get("subExternalId"))
             lis_name = item.get("lisName")
+            ## 08/08 change start
             if parent_pid and lis_name:
-                keymap[(parent_pid, lis_name)] = item
+                key = (parent_pid, lis_name)
+                if key not in keymap:
+                    keymap[key] = []
+                keymap[key].append(item)
+                ## 08/08 change emd
+
         return keymap
     
     def fetch_option_product_ids(self, sf, keymap, batch_size=50):
@@ -159,22 +165,29 @@ class SalesForce:
                 all_records.setdefault(key, []).append(r)
         return all_records
     
+    ## 08/08 change start function
     def update_lineitem_product_ids(self, lineitems, keymap, option_pid_map):
-        for (parent_pid, lis_name), item in keymap.items():
+        for (parent_pid, lis_name), items in keymap.items():
             records = option_pid_map.get((parent_pid, lis_name), [])
             if not records:
-                item['ProductId'] = None
-                item['Option_Product_Name__c'] = None
-                item['Component_Charge_Name__c'] = None
-                item['OwnerId'] = None
-                item['Note'] = "No exact match found based on Line Item Source Name"
+                for item in items:
+                    item['ProductId'] = None
+                    item['Option_Product_Name__c'] = None
+                    item['Component_Charge_Name__c'] = None
+                    item['OwnerId'] = None
+                    item['Note'] = "No exact match found based on Line Item Source Name"
             else:
                 record = records[0]  # Take the latest by CreatedDate
-                item['ProductId'] = record.get('SBQQ__OptionalSKU__c')
-                item['Option_Product_Name__c'] = record.get('Option_Product_Name__c')
-                item['Component_Charge_Name__c'] = record.get('Component_Charge_Name__c')
-                item['OwnerId'] = record.get('OwnerId')
-                item['Note'] = "Duplicate Line Item Source Names found, Id was taken from latest CreatedDate" if len(records) > 1 else "Successfully Matched"
+                for item in items:
+                    item['ProductId'] = record.get('SBQQ__OptionalSKU__c')
+                    item['Option_Product_Name__c'] = record.get('Option_Product_Name__c')
+                    item['Component_Charge_Name__c'] = record.get('Component_Charge_Name__c')
+                    item['OwnerId'] = record.get('OwnerId')
+                    item['Note'] = (
+                        "Duplicate Line Item Source Names found, Id was taken from latest CreatedDate"
+                        if len(records) > 1 else "Successfully Matched"
+                    )
+    ## 08/08 change end
 
     #======Functions for Sub Conscumption Schedule========
     def fetch_product_consumption_schedules(self, sf, product_ids, batch_size=100):
@@ -291,6 +304,7 @@ class SalesForce:
 
         # --- SUBSCRIPTIONS ---
         subscriptions = self.get_all_records(data, "Subscription")
+        subscriptions = [item for item in subscriptions if item.get("ProductName") and item.get("ProductName").strip()]
         self.update_subscription_names_from_country(subscriptions, country_map)
         product_names = self.get_unique_product_names(subscriptions)
         product_field_map = self.fetch_product2_fields(sf, product_names)
@@ -298,6 +312,11 @@ class SalesForce:
 
         # --- LINE ITEM SOURCES ---
         lineitems = self.get_all_records(data, "LineItemSource")
+        # Filter out line items with blank lisName
+        lineitems = [
+        item for item in lineitems
+        if item.get("lisName") and item.get("lisName").strip() and item.get("BaseAddon__c") != "In Additional"
+    ]
         # --- SKU sheet mapping logic for lisName update ---
         sku_df = dfs.get('SKU')
         if sku_df is not None and sku_df.shape[1] >= 4:
@@ -323,6 +342,11 @@ class SalesForce:
         keymap = self.get_lineitem_keys(lineitems, subext_to_pid)
         option_pid_map = self.fetch_option_product_ids(sf, keymap)
         self.update_lineitem_product_ids(lineitems, keymap, option_pid_map)
+
+        ## 08/04 change
+        # Remove duplicate sub-lis pairs - keep only items that are in keymap
+        lineitems = [item for item in lineitems if (subext_to_pid.get(item.get("subExternalId")), item.get("lisName")) in keymap]
+        ## end of change
         
         # --- SUB CONSUMPTION SCHEDULES ---
         sub_consumption_schedules = self.get_all_records(data, "subConsumptionSchedule")
@@ -341,9 +365,43 @@ class SalesForce:
         subext_to_subcsid = {item.get("subExternalId"): item.get("subCsId") for item in sub_consumption_schedules if item.get("subExternalId") and item.get("subCsId")}
         self.update_sub_consumption_rates(sub_consumption_rates, subext_to_subcsid, consumption_rate_map)
 
-        # --- SUMMARY COUNTS ---
-        subscriptions = self.get_all_records(data, "Subscription")
+        # --- 08/06 change start (DEDUPLICATION) ---
+        # --- FINAL DEDUPLICATION OF LINE ITEM SOURCES ---
         lineitems = self.get_all_records(data, "LineItemSource")
+        
+        # Deduplication: prioritize records with ProductId not null or Note == "Successfully Matched"
+        seen = {}
+        for item in lineitems:
+            key = (item.get("lisName", "NA"), item.get("subExternalId", "NA"))
+            current_priority = 0
+            if item.get("ProductId"):
+                current_priority = 2  # Highest priority
+            elif item.get("Note") == "Successfully Matched":
+                current_priority = 1  # Medium priority
+            
+            if key not in seen or current_priority > seen[key]["priority"]:
+                seen[key] = {"item": item, "priority": current_priority}
+        
+        unique_items = [entry["item"] for entry in seen.values()]
+        
+        # Update data with deduplicated items
+        for group in data.get("output_records", []):
+            if group.get("name") == "LineItemSource":
+                group["data"] = unique_items
+                break
+        
+        print(f"[Deduplication] Removed {len(lineitems) - len(unique_items)} duplicate LineItemSource records")
+
+        subscriptions = self.get_all_records(data, "Subscription")
+        lineitems = unique_items
+        
+        # --- 08/06 change end (DEDUPLICATION) ---
+
+        # 08/04 change start (FIXING NOTES)
+        for item in lineitems:
+            if not item.get("Note") or item.get("Note").strip() == "":
+                item["Note"] = "Failed to match to Salesforce records" ## 08/06 change
+        # 08/04 change end (FIXING NOTES)
 
         data["ExtractedSubCnt"] = len(subscriptions)
         data["ExtractedLisCnt"] = len(lineitems)
@@ -374,7 +432,7 @@ class SalesForce:
         if data.get('ActualLisCnt', 0) == 0 and data.get('ExtractedLisCnt', 0) == 0:
             data["% LIS Extraction Confidence Score"] = "NA"
         elif data.get('ActualLisCnt'):
-            data["% LIS Extraction Confidence Score"] = f"{(1 - abs(data['ExtractedLisCnt'] - data['ActualLisCnt']) / max(data['ActualLisCnt'], 1)) * 100:.2f}%"
+            data["% LIS Extraction Confidence Score"] = f"{(1 - abs(data['ExtractedLisCnt'] - data['ActualLisCnt']) / max(data['ExtractedLisCnt'], data['ActualLisCnt'], 1)) * 100:.2f}%"
         else:
             data["% LIS Extraction Confidence Score"] = "NA"
         print(f"conf score: {data['ActualSubCnt']}")

@@ -1,84 +1,127 @@
 import io
-import re
 import json
-import uuid
-import logging
-from openai import AsyncOpenAI
-from datetime import datetime
-from config import get_ssm_param
 import pandas as pd
+from openai import AsyncOpenAI
+import time
+from datetime import datetime
 import pdfplumber
 import asyncio
+from config import get_ssm_param
 
-# Configure logging
-logger = logging.getLogger(__name__)
+# ========== ENV SETUP ==========
 
 class ContractExtractor:
-
     def __init__(self):
-        # ========== ENV SETUP ==========
         self.OPENAI_API_KEY = get_ssm_param("/myapp/openai_api_key")
-        # self.SUBSCRIPTION_INSTRUCTIONS = get_ssm_param("/myapp/subscription_prompt")
-        # self.CONTRACT_INSTRUCTIONS = get_ssm_param("/myapp/contract_prompt")
         self.openai = AsyncOpenAI(api_key=self.OPENAI_API_KEY)
-
+        
+        # Contract extraction instructions
         self.CONTRACT_INSTRUCTIONS = """
-        You are an intelligent field extractor. You are given a document that may contain one or more service subscriptions grouped under a single contract. Your task is to extract all relevant fields and return a **single structured JSON object** in a **nested format**, organized as follows:
+You are an intelligent field extractor. You are given a document that may contain one or more service subscriptions grouped under a single contract. Your task is to extract all relevant fields and return a **single structured JSON object** in a **nested format**, organized as follows:
 
-        - The top level represents the **contract**.
+- The top level represents the **contract**.
 
-        If a value is not present, return `"NA"`. Do not leave any field blank.
+If a value is not present, return `"NA"`. Do not leave any field blank.
 
-        ---
+---
 
-        ## CONTRACT-LEVEL FIELDS (top-level keys in the JSON)
+## CONTRACT-LEVEL FIELDS (top-level keys in the JSON)
 
-        Extract the following fields based on their respective sections in the document:
+Extract the following fields based on their respective sections in the document:
 
-        ### CUSTOMER INFORMATION
-        Extract from the **Customer Information** section. If the field is not explicitly listed, return "NA":
+### CUSTOMER INFORMATION
+Extract from the **Customer Information** section. If the field is not explicitly listed, return "NA":
 
-        - `AccountName`: The name of the Customer, always before the ("Customer") string and the first line under Customer Information.
-        - `BillingStreet`
-        - `BillingCity`
-        - `BillingState`
-        - `BillingPostalCode`
-        - `BillingCountry`
+- `AccountName`: The name of the Customer, always before the (\"Customer\") string and the first line under Customer Information.\n
 
-        ### GENERAL SERVICE FEES
-        Extract from the **General Service Fees** section:
+### GENERAL SERVICE FEES
+Extract from the **General Service Fees** section:
 
-        - `ImplementationFee`: extract the numerical price under the item name "Implementation Fee". 0 if waived.
-        - `LicenseFee`: extract the numerical price under the item name "License Fee". 0 if waived.
+- `ImplementationFee`: extract the numerical price under the item name "Implementation Fee". 0 if waived. NA if not found.
+- `LicenseFee`: extract the numerical price under the item name "License Fee". 0 if waived. NA if not found.    
+
+### FEES AND PAYMENT TERMS or ## Payment Terms
+Extract from the **Fees and Payment Terms** or **Payment Terms** section if available:
+
+- `ContractTerm`: extract the number of months from the line beginning with "Initial Term". NA if none.
+- `PaymentMethod__c`: extract from the field labeled "Payment Method". NA if not found.
+- `PrepaidCredits__c`: extract the numeric value of "Prepaid Usage Credit"; if none, return "NA"
+- `Minimum_Monthly__c`: 
+    - Under **Payment Terms** section, if available, understand the context of what is the updated minimum monthly commitment.
+    - Example: If it is indicated "The Parties hereby agree to amend the Monthly Minimum Commitment amount under the Original Order
+Form to $1,000" then return "1000" without any currency.
+    - If no amount change is indicated, return "NA".
 
 
-        ### FEES AND PAYMENT TERMS
-        Extract from the **Fees and Payment Terms** section:
+### FEES AND PAYMENT TERMS or ### GENERAL TERMS AND CONDITIONS OR ### TERMS AND CONDITIONS
+Extract from the **Fees and Payment Terms** section or signature date under **General Terms and Conditions** section
+- `StartDate`: (formatted as YYYY-MM-DD)
+- Also exact date under "Effective Date" under "# Fees and Payment Terms" or "# Payment Terms" if there is an exact date. If none,
+    - Check "# General Terms and Conditions" or # Terms and Conditions section, and extract the **latest date** found in the signature section of either Trulioo or the Customer Authorized Representative.
+    - Most likely, there is a present date, in either of the two.
 
-        - `ContractTerm`: extract the number of months from the line beginning with “Initial Term”
-        - `CurrencyIsoCode`: get the ISO currency code from the “Prepaid Usage Credit”. 
-            - If "$", it is automatically USD. Do not base currency on country.
-        - `PaymentMethod__c`: extract from the field labeled “Payment Method”
-        - `PrepaidCredits__c`: extract the numeric value of “Prepaid Usage Credit”; if none, return "NA"
-        - `Minimum_Monthly__c`: extract the number from “Monthly Minimum Commitment”; if none, return "NA"
+**NOTE** Ensure that you have read the contract and was able to apply whether there are amendments on any of the fields we are extracting. Always extract the new amended values.
 
-        ### FEES AND PAYMENT TERMS or ### GENERAL TERMS AND CONDITIONS OR ### TERMS AND CONDITIONS
-        Extract from the **Fees and Payment Terms** section or signature date under **General Terms and Conditions** section
-        - `StartDate`: (formatted as YYYY-MM-DD)
-            - Also exact date under "Effective Date" under "# Fees and Payment Terms" if there is an exact date. If none,
-            - Check "# General Terms and Conditions" or # Terms and Conditions section, and extract the **latest date** found in the signature section of either Trulioo or the Customer Authorized Representative.
-            - Most likely, there is a present date, in either of the two.
+"""
+        
+        # Subscription extraction instructions
+        self.SUBSCRIPTION_INSTRUCTIONS = """
+You are an intelligent field extractor. You are given a document containing a single **subscription block** for a specific country. Your task is to extract the relevant subscription and list item fields, and return a structured JSON object in the following format:
 
-        """
+```json
+{
+  "subscriptions": [
+    {
+      <Subscription-level fields>,
+      "listitemsource": [ ...list items for this subscription... ]
+    }
+  ]
+}
+```
 
-    # ========== FIELD EXTRACTION LOGIC ==========
+If a value is not present, return \"NA\". Do not leave any field blank.
 
-#############################################################################################
+IMPORTANT: Always use the exact country name as it appears in the input document for the subscriptionName field. Do not abbreviate, translate, or normalize it.
+---
+
+## `subscriptions` (list of subscription blocks grouped by country)
+
+**For each subscription**, extract the following:
+
+- `subscriptionName`: the country where this subscription applies. 
+    - This should be a valid country name.
+    - If there are extra words or phrases after the country name, remove, and only return the country name. (e.g. "Japan" NOT "Japan Configuration")
+- `subCsName`: set as `"<subscriptionName> Transactions - Direct Consumption Schedules"`
+- `subCrName`: set as `"<subscriptionName> Transactions - Consumption Rate"`
+-  Price__c: the numeric value of the "Fee per Query" for the Base Configuration in the subscription block (usually the first row). NA if there is no Base Configuration.
+---
+
+### `listitemsource` (inside each subscription block)
+
+This is a list of rows representing the selected services under each subscription block.
+
+**Each row represents an item listed under the "Selected Services and Pricing: Person Match" section of the document.**
+
+For each row, extract:
+
+- `lisName`: from the "Name" field of the row
+- `BaseAddon__c`:  
+  - "Base" if Type is "Base" or "In-Base"  
+  - "Add-On" if Type is "Additional"
+  - "In Additional" if Type is "In Additional"
+- `Description__c`: from the "Comments" column
+- `Included__c`:  
+  - "TRUE" if the "Fee per Query" is marked "Included"  
+  - "FALSE" otherwise
+- `scsName`: set as `"<lisName> Consumption Schedule"`
+- `scrName`: set as `"<lisName> Consumption Rate"`
+- `Price__c`: the numeric value from "Fee per Query", or 0 if "Included"
+"""
 
     async def extract_contract_fields(self, text):
-
+        """Extract contract-level fields using LLM."""
         # Add delay before API call
-        await asyncio.sleep(1)
+        await asyncio.sleep(5)
 
         response = await self.openai.chat.completions.create(
             model="gpt-4.1",
@@ -89,14 +132,12 @@ class ContractExtractor:
                 {"role": "user", "content": text}
             ]
         )
-            # Print the raw JSON string returned by the model
         print("\n===== Raw LLM Extract Contract Output =====")
         print(response.choices[0].message.content.strip())
         return json.loads(response.choices[0].message.content.strip())
 
-
-    # ===== SUBSCRIPTIONS
     async def call_llm_for_chunk_boundaries(self, full_doc_text):
+        """Find country boundaries in the document."""
         system_prompt = (
             "You are an expert document parsing assistant. "
             "Your job is to extract country boundaries in the 'Selected Services and Pricing: Person Match' section, "
@@ -104,61 +145,60 @@ class ContractExtractor:
         )
 
         user_prompt = f"""
-    You are given a contract document in markdown or plain text.  
-    Your task is to **find all country blocks** under the section titled 'Selected Services and Pricing: Person Match'.
-    The section header may be written in different ways such as use of ampersand, different spacing but similar to Selected Services and Pricing: Person Match
+You are given a contract document in markdown or plain text.  
+Your task is to **find all country blocks** under the section titled 'Selected Services and Pricing: Person Match'.
+The section header may be written in different ways such as use of ampersand, different spacing but similar to Selected Services and Pricing: Person Match
 
+# INSTRUCTIONS
 
-    # INSTRUCTIONS
+## 1. SCOPE
+- Only consider content after the line that marks the start of 'Selected Services and Pricing: Person Match' (any case variation is fine).
+- Ignore unrelated headers within this section (like '# Query Fees by Country and Type', '# General', '# Query Fee Information', etc).
+- Continue processing until you reach the start of a truly new section, such as:
+    - 'General Terms and Conditions'
+    - 'Selected Services and Pricing: Workflow Studio'
+    - 'Selected Services and Pricing: Watchlist'
+    - 'Identity Document Verification'
+    - or other top-level 'Selected Services' sections.
 
-    ## 1. SCOPE
-    - Only consider content after the line that marks the start of 'Selected Services and Pricing: Person Match' (any case variation is fine).
-    - Ignore unrelated headers within this section (like '# Query Fees by Country and Type', '# General', '# Query Fee Information', etc).
-    - Continue processing until you reach the start of a truly new section, such as:
-        - 'General Terms and Conditions'
-        - 'Selected Services and Pricing: Workflow Studio'
-        - 'Selected Services and Pricing: Watchlist'
-        - 'Identity Document Verification'
-        - or other top-level 'Selected Services' sections.
+## 2. IDENTIFY COUNTRY BLOCKS
+- A country block **always begins** with a line that is clearly a country header, such as:
+    - A line with only a country name (e.g. "Norway")
+    - Or the country name marked as a header ("# Norway", "## Norway", "**Norway**", etc.)
+- A valid country block **must** have a markdown table immediately after the country header. The table should contain at least the columns 'Name', 'Type', and 'Fee per Query'. The table may optionally include a 'Comments' column.
+- There may be other markdown headers or lines between country blocks—ignore them unless they mark the start of a new section as defined above.
 
-    ## 2. IDENTIFY COUNTRY BLOCKS
-    - A country block **always begins** with a line that is clearly a country header, such as:
-        - A line with only a country name (e.g. "Norway")
-        - Or the country name marked as a header ("# Norway", "## Norway", "**Norway**", etc.)
-    - A valid country block **must** have a markdown table immediately after the country header. The table should contain at least the columns 'Name', 'Type', and 'Fee per Query'. The table may optionally include a 'Comments' column.
-    - There may be other markdown headers or lines between country blocks—ignore them unless they mark the start of a new section as defined above.
+## 3. FINDING END OF BLOCK
+- The end of a country block is marked by the **start line** of the next country header (per the above definition).
+- If there are no more country blocks, the end is the start line of the next true section (see SCOPE above), or the end of the document.
 
-    ## 3. FINDING END OF BLOCK
-    - The end of a country block is marked by the **start line** of the next country header (per the above definition).
-    - If there are no more country blocks, the end is the start line of the next true section (see SCOPE above), or the end of the document.
+## 4. OUTPUT FORMAT
+- For each country block, output an object:
+    - "country": the country name as it appears (do not normalize or translate)
+    - "start_line_text": the exact line marking the start of this country block (the country header)
+    - "end_line_text": the exact line marking the start of the next country block, or the start of the next section, or "END" if at the end of document
+- Return a single JSON object with key "boundaries" and a list of these objects, **in order of appearance**.
 
-    ## 4. OUTPUT FORMAT
-    - For each country block, output an object:
-        - "country": the country name as it appears (do not normalize or translate)
-        - "start_line_text": the exact line marking the start of this country block (the country header)
-        - "end_line_text": the exact line marking the start of the next country block, or the start of the next section, or "END" if at the end of document
-    - Return a single JSON object with key "boundaries" and a list of these objects, **in order of appearance**.
+## 5. IMPORTANT RULES
+- **DO NOT** end a country block on an unrelated header (such as '# Query Fees by Country and Type')—these are not true section ends.
+- **DO NOT** stop processing until you reach a major new section or end of the document.
+- **DO NOT** output any explanation, commentary, or formatting—only the JSON object as specified.
+- **Never skip a country/table just because of intervening markdown headers.**
 
-    ## 5. IMPORTANT RULES
-    - **DO NOT** end a country block on an unrelated header (such as '# Query Fees by Country and Type')—these are not true section ends.
-    - **DO NOT** stop processing until you reach a major new section or end of the document.
-    - **DO NOT** output any explanation, commentary, or formatting—only the JSON object as specified.
-    - **Never skip a country/table just because of intervening markdown headers.**
+## 6. EXAMPLES OF TRUE SECTION ENDS
+- "# General Terms and Conditions"
+- "# Selected Services and Pricing: Workflow Studio"
+- "# Selected Services and Pricing: Watchlist"
+- "# Identity Document Verification"
+- "# Fees and Payment Terms"
+- or similar top-level headings.
 
-    ## 6. EXAMPLES OF TRUE SECTION ENDS
-    - "# General Terms and Conditions"
-    - "# Selected Services and Pricing: Workflow Studio"
-    - "# Selected Services and Pricing: Watchlist"
-    - "# Identity Document Verification"
-    - "# Fees and Payment Terms"
-    - or similar top-level headings.
-
-    DOCUMENT:
-    ---
-    {full_doc_text}
-    """
+DOCUMENT:
+---
+{full_doc_text}
+"""
         # Add delay before API call
-        await asyncio.sleep(1)
+        await asyncio.sleep(5)
 
         response = await self.openai.chat.completions.create(
             model="gpt-4.1",
@@ -171,8 +211,9 @@ class ContractExtractor:
         )
         data = json.loads(response.choices[0].message.content)
         return data["boundaries"]
-    
+
     def chunk_doc_by_country_boundaries(self, md_text, boundaries):
+        """Split document into country-specific chunks."""
         results = []
         remaining_text = md_text
 
@@ -204,14 +245,14 @@ class ContractExtractor:
                 "text": chunk.strip()
             })
 
-        # Print all country chunks (optional, you can comment out if not needed)
         print(f"\n==== All Extracted Country Chunks ====")
         for chunk in results:
             print(f"\n[Country: {chunk['country']}]\n{'-'*40}\n{chunk['text']}\n{'='*40}")
 
         return results
-    
+
     async def call_llm_for_extraction(self, batch_chunks):
+        """Extract subscription data from country chunks."""
         batch_text = "\n\n".join(chunk["text"] for chunk in batch_chunks)
 
         system_prompt = (
@@ -219,91 +260,68 @@ class ContractExtractor:
             "Your job is to extract structured data from contract subscription blocks."
         )
         user_prompt = f"""
-    You are given chunks with up to 3 country subscription blocks below. One subscription block is one country.
-    A subscription block can be from multiple CONSECUTIVE tables. Every table is part of a latest country before it.
+You are given chunks with up to 3 country subscription blocks below. One subscription block is one country.
+A subscription block can be from multiple CONSECUTIVE tables. Every table is part of a latest country before it.
 
-    Return a structured JSON object in the following format:
+Return a structured JSON object in the following format:
 
+{{
+  "subscriptions": [
     {{
-    "subscriptions": [
-        {{
-        <Subscription-level fields>,
-        "listitemsource": [ ...list items for this subscription... ]
-        }}
-    ]
+      <Subscription-level fields>,
+      "listitemsource": [ ...list items for this subscription... ]
     }}
+  ]
+}}
 
-    IMPORTANT: Always use the exact country name as it appears in the input document for the subscriptionName field. Do not abbreviate, translate, or normalize it.
-    ---
+IMPORTANT: Always use the exact country name as it appears in the input document for the subscriptionName field. Do not abbreviate, translate, or normalize it.
+---
 
-    ## Edgecase: Multiple Tables belonging to one Subscription block ##
-    - If there is a markdown table in the text that is NOT directly under a country header, it MUST be included as part of the most recent preceding country’s subscription block.
-    - Even if a table has a header or text above it, and is not a country, treat it as a continuation of the previous table, and under the most recent country.
-    - Never leave any table or list item unassigned. Every table belongs to the country that came before it.
-    Example:
-    ## Country
+## Edgecase: Multiple Tables belonging to one Subscription block ##
+- If there is a markdown table in the text that is NOT directly under a country header, it MUST be included as part of the most recent preceding country's subscription block.
+- Even if a table has a header or text above it, and is not a country, treat it as a continuation of the previous table, and under the most recent country.
+- Never leave any table or list item unassigned. Every table belongs to the country that came before it.
 
-    | Name                  | Type    | Fee per Query                                |
-    |-----------------------|---------|----------------------------------------------|
-    | Line Item Source 1 | Base    | $<price>                              |
-    ```
+---
 
-    ## General
-    ```markdown
-    <lines in between that are not country>
+# Field extraction guidelines
+## `subscriptions` (list of subscription blocks grouped by country)
+**For each subscription**, extract the following:
 
-    | Name           | Type     | Fee per Query                                     |
-    |----------------|----------|--------------------------------------------------|
-    | Line Item Source 2  | In Base  | Included in Fee per query for Base Configuration |
+- `subscriptionName`: the country where this subscription applies
+- `subCsName`: set as `"<subscriptionName> Transactions - Direct Consumption Schedules"`
+- `subCrName`: set as `"<subscriptionName> Transactions - Consumption Rate"`
+- `Price__c`: the numeric value of the "Fee per Query" for the Base Configuration in the subscription block (usually the first row). NA if there is no Base Configuration.
 
-    - From the example, the table with Line Item Source 2 is a continuation of previous table since it does not have a country above it,
-    - Every table belongs to the country that came before it. Do not disregard any table.
+---
 
-    ---
+### `listitemsource` (inside each subscription block)
 
-    # Field extraction guidelines
-    ## `subscriptions` (list of subscription blocks grouped by country)
-    **For each subscription**, extract the following:
+This is a list of rows representing the selected services under each subscription block.
 
-    - `subscriptionName`: the country where this subscription applies. 
-        - This should be a valid country name.
-        - If there are extra words or phrases after the country name, remove, and only return the country name. (e.g. "Japan" NOT "Japan Configuration")
-    - `CurrencyIsoCode`: always "USD"
-    - `subCsName`: set as `"<subscriptionName> Transactions - Direct Consumption Schedules"`
-    - `subCrName`: set as `"<subscriptionName> Transactions - Consumption Rate"`
-    - `Price__c`: the numeric value of the "Fee per Query" for the Base Configuration in the subscription block (usually the first row). NA if there is no Base Configuration.
-    - `HasBaseConfiguration`: True if one row under a subscription block has the words 'Base Configuration' under the Name items, else false. (example: "Base Configuration", "Canada Base Configuration")
-    ---
+For each row, extract:
 
-    ### `listitemsource` (inside each subscription block)
+- `lisName`: from the "Name" field of the row
+- `BaseAddon__c`:  
+  - "Base" if Type is "Base" or "In-Base"  
+  - "Add-On" if Type is "In Additional" or "Additional"
+- `Description__c`: from the "Comments" column
+- `Included__c`:  
+  - "TRUE" if the "Fee per Query" is marked "Included"  
+  - "FALSE" otherwise
+- `scsName`: set as `"<lisName> Consumption Schedule"`
+- `scrName`: set as `"<lisName> Consumption Rate"`
+- `Price__c`: the numeric value from "Fee per Query", or 0 if "Included"
 
-    This is a list of rows representing the selected services under each subscription block.
+- If a value is missing, use "NA". Do not leave any field blank.
+- If there are fewer than 3 countries, just return as many as you find.
 
-    For each row, extract:
-
-    - `lisName`: from the "Name" field of the row
-    - `BaseAddon__c`:  
-    - "Base" if Type is "Base" or "In-Base"  
-    - "Add-On" if Type is "Additional"
-    - "In Additional" if Type is "In Additional"
-    - `CurrencyIsoCode`: always "USD"
-    - `Description__c`: from the "Comments" column
-    - `Included__c`:  
-    - "TRUE" if the "Fee per Query" is marked "Included"  
-    - "FALSE" otherwise
-    - `scsName`: set as `"<lisName> Consumption Schedule"`
-    - `scrName`: set as `"<lisName> Consumption Rate"`
-    - `Price__c`: the numeric value from "Fee per Query", or 0 if "Included"
-
-    - If a value is missing, use "NA". Do not leave any field blank.
-    - If there are fewer than 3 countries, just return as many as you find.
-
-    TEXT:
-    ---
-    {batch_text}
-    """
+TEXT:
+---
+{batch_text}
+"""
         # Add delay before API call
-        await asyncio.sleep(1)
+        await asyncio.sleep(5)
 
         response = await self.openai.chat.completions.create(
             model="gpt-4.1",
@@ -315,25 +333,20 @@ class ContractExtractor:
             ]
         )
         data = json.loads(response.choices[0].message.content)
-        return data  # Will have "subscriptions" as key
-    
+        return data
+
     async def extract_all_subscriptions_from_chunks(self, country_chunks, batch_size=3):
-        """
-        Given all country_chunks [{country, text}], returns all extracted subscription blocks.
-        Prints the country chunk contents and LLM response per batch.
-        """
+        """Extract all subscriptions from country chunks in batches."""
         all_subs = []
         for batch in self.batch_chunks(country_chunks, batch_size):
             countries = [c['country'] for c in batch]
             print(f"\n--- Extracting batch: {countries} ---")
 
-            # Print the chunk texts
             for chunk in batch:
                 print(f"\n[Chunk: {chunk['country']}]\n{'-'*40}\n{chunk['text']}\n{'='*40}")
 
             res = await self.call_llm_for_extraction(batch)
 
-            # Print the LLM response for this batch (pretty-printed)
             print(f"\n[LLM Response for batch: {countries}]\n{'-'*50}\n{json.dumps(res, indent=2, ensure_ascii=False)}\n{'='*50}")
 
             all_subs.extend(res["subscriptions"])
@@ -344,19 +357,21 @@ class ContractExtractor:
         for i in range(0, len(chunks), batch_size):
             yield chunks[i:i+batch_size]
 
-    # ========== ENRICHMENT ==========
-    def enrich_llm_response(self, llm_response):
-        contractExternalId = f"{str(uuid.uuid4())}"
-        llm_response["contractExternalId"] = contractExternalId
+    def enrich_llm_response(self, llm_response, contract_external_id):
+        """Add unique IDs to the extracted data."""
+        llm_response["contractExternalId"] = contract_external_id
 
         subscriptions = llm_response.get("subscriptions", [])
-        valid_subscriptions = []  ## 07/30 NEW LINE 0
+        valid_subscriptions = []  # New list to store only valid subscriptions
         
         for i, subscription in enumerate(subscriptions, start=1):
+            # Filter subscriptionName once here
             subscription_name = subscription.get("subscriptionName", "NA")
             if subscription_name != "NA":
+                import re
                 unwanted_words = r'\b(?:General|Country:|Configuration|Fee|Pricing|Information|country|base configuration|table|details|services|structure)\b'
                 subscription_name = re.sub(unwanted_words, '', subscription_name, flags=re.IGNORECASE).strip()
+                # Clean up extra spaces
                 subscription_name = re.sub(r'\s+', ' ', subscription_name).strip()
                 if not subscription_name:
                     subscription_name = "NA"
@@ -364,23 +379,20 @@ class ContractExtractor:
             # Update the subscription with filtered name
             subscription["subscriptionName"] = subscription_name
             
-            ## 07/30 new lines 1
             # Skip subscriptions with blank/NA subscriptionName
             if subscription_name == "NA" or not subscription_name.strip():
                 print(f"Skipping subscription {i}: blank subscriptionName")
                 continue
-            ## end of 07/30 new lines 1
             
             # Only assign external IDs to valid subscriptions
-            sub_external_id = f"sub{i}_{contractExternalId}"
-            subcs_external_id = f"subcs{i}_{contractExternalId}"
-            subcr_external_id = f"subcr{i}_{contractExternalId}"
+            sub_external_id = f"amd_sub{i}_{contract_external_id}"
+            subcs_external_id = f"amd_subcs{i}_{contract_external_id}"
+            subcr_external_id = f"amd_subcr{i}_{contract_external_id}"
 
             subscription["subExternalId"] = sub_external_id
             subscription["subCsExternalId"] = subcs_external_id
             subscription["subCrExternalId"] = subcr_external_id
-        
-            ## 07/30 new lines 2
+
             # Filter out invalid list items
             valid_list_items = []
             non_base_count = 1
@@ -397,9 +409,9 @@ class ContractExtractor:
                     continue
                 
                 # Only assign external IDs to valid list items
-                item["lisExternalId"] = f"lis{non_base_count}_{sub_external_id}"
-                item["scsExternalId"] = f"scs{non_base_count}_{sub_external_id}"
-                item["scrExternalId"] = f"scr{non_base_count}_{sub_external_id}"
+                item["lisExternalId"] = f"amd_lis{non_base_count}_{sub_external_id}"
+                item["scsExternalId"] = f"amd_scs{non_base_count}_{sub_external_id}"
+                item["scrExternalId"] = f"amd_scr{non_base_count}_{sub_external_id}"
                 non_base_count += 1
                 valid_list_items.append(item)
             
@@ -410,12 +422,10 @@ class ContractExtractor:
         # Update llm_response with only valid subscriptions
         llm_response["subscriptions"] = valid_subscriptions
 
-        ## 07/30 end of modified lines 2
-        
         return llm_response
-    
-    # === CREATION OF DATAFRAMES ===
+
     def create_contract_dataframe(self, llm_response):
+        """Create contract dataframe."""
         contract_fields = {
             "AccountId": "",
             "AccountName": llm_response.get("AccountName", "NA"),
@@ -426,8 +436,8 @@ class ContractExtractor:
             "BillingState": llm_response.get("BillingState", "NA"),
             "BillingStreet": llm_response.get("BillingStreet", "NA"),
             "ContractTerm": llm_response.get("ContractTerm", "NA"),
-            "CurrencyIsoCode": llm_response.get("CurrencyIsoCode", "NA"),
-            "Description": "Test Data Load",
+            "CurrencyIsoCode": "",
+            "Description": "",
             "Minimum_Monthly__c": llm_response.get("Minimum_Monthly__c", "NA"),
             "OwnerId": "",
             "PaymentMethod__c": llm_response.get("PaymentMethod__c", "NA"),
@@ -457,20 +467,18 @@ class ContractExtractor:
             "SBQQ__RenewalQuoted__c": ""
         }
         return pd.DataFrame([contract_fields])
-    
-    def create_subscription_dataframe(self, llm_response):
-        subscriptions = llm_response.get("subscriptions", [])
-        
 
+    def create_subscription_dataframe(self, llm_response):
+        """Create subscription dataframe."""
+        subscriptions = llm_response.get("subscriptions", [])
         records = []
         for entry in subscriptions:
-
             record = {
                 "subExternalId": entry.get("subExternalId", "NA"),
                 "ProductName": entry.get("subscriptionName", "NA"),
                 "ContractExternalId": llm_response.get("contractExternalId", "NA"),
                 "ContractName": llm_response.get("AccountName", "NA"),
-                "CurrencyIsoCode": entry.get("CurrencyIsoCode", "NA"),
+                "CurrencyIsoCode": "USD",
                 "LicenseFee": llm_response.get("LicenseFee", "NA"), 
                 "_InvoiceSchedule__c": "",
                 "OwnerId": "",
@@ -498,49 +506,24 @@ class ContractExtractor:
                 "SBQQ__RequiredById__c": "",
                 "SBQQ__RequiredByProduct__c": "",
                 "SBQQ__SubscriptionPricing__c": "",
-                "SBQQ__SubscriptionType__c": "",
-                "HasBaseConfiguration": entry.get("HasBaseConfiguration", "NA") ## 08/04 change added BC flag
+                "SBQQ__SubscriptionType__c": ""
             }
             records.append(record)
-
         return pd.DataFrame(records)
-    
-    def create_line_item_source_dataframe(self, llm_response):
-        ## 08/04 change start (duplicate removal)
-        subscriptions = llm_response.get("subscriptions", [])
 
+    def create_line_item_source_dataframe(self, llm_response):
+        """Create line item source dataframe."""
+        subscriptions = llm_response.get("subscriptions", [])
         records = []
-        seen_pairs = set()  # Track seen (lisName, subExternalId) pairs
-        duplicate_count = 0
-        
         for sub in subscriptions:
             list_items = sub.get("listitemsource", [])
             for item in list_items:
                 if "base configuration" in (item.get("lisName", "")).lower():
                     continue
-                # Skip "In Additional" items to match Salesforce enrichment logic
-                if item.get("BaseAddon__c") == "In Additional":
-                    continue 
-
-                lis_name = item.get("lisName", "NA")
-                sub_external_id = sub.get("subExternalId", "NA")
-                
-                # Create unique pair for duplicate checking
-                pair_key = (lis_name, sub_external_id)
-                
-                # Skip if this pair has already been seen
-                if pair_key in seen_pairs:
-                    duplicate_count += 1
-                    print(f"Removing duplicate LineItemSource: lisName='{lis_name}', subExternalId='{sub_external_id}'")
-                    continue
-                
-                # Add to seen pairs
-                seen_pairs.add(pair_key)
-
                 record = {
                     "lisExternalId": item.get("lisExternalId", "NA"),
-                    "lisName": lis_name,
-                    "subExternalId": sub_external_id,
+                    "lisName": item.get("lisName", "NA"),
+                    "subExternalId": sub.get("subExternalId", "NA"),
                     "subscriptionName": sub.get("subscriptionName", "NA"),
                     "BaseAddon__c": item.get("BaseAddon__c", "NA"),
                     "CurrencyIsoCode": "USD",
@@ -556,18 +539,11 @@ class ContractExtractor:
                     "SubscriptionTerm__c": llm_response.get("ContractTerm", "NA")
                 }
                 records.append(record)
-
-        print(f"=== LINE ITEM SOURCE DUPLICATE REMOVAL ===")
-        print(f"Total duplicates removed: {duplicate_count}")
-        print(f"Final unique records: {len(records)}")
-        print(f"==========================================")
-
         return pd.DataFrame(records)
-    ## 08/04 change end (duplicate removal)
-    
-    def create_subscription_consumption_schedule_dataframe(self, llm_response):
-        subscriptions = llm_response.get("subscriptions", [])
 
+    def create_subscription_consumption_schedule_dataframe(self, llm_response):
+        """Create subscription consumption schedule dataframe."""
+        subscriptions = llm_response.get("subscriptions", [])
         records = []
         for sub in subscriptions:
             record = {
@@ -575,18 +551,17 @@ class ContractExtractor:
                 "subCsName": sub.get("subCsName", "NA"),
                 "subExternalId": sub.get("subExternalId", "NA"),
                 "subscriptionName": sub.get("subscriptionName", "NA"),
-                "CurrencyIsoCode": sub.get("CurrencyIsoCode", "NA"),
+                "CurrencyIsoCode": "USD",
                 "LineItemSource__c": "",
                 "RatingMethod__c": "Tier",
                 "Type__c": "Range"
             }
             records.append(record)
-
         return pd.DataFrame(records)
 
     def create_subscription_consumption_rate_dataframe(self, llm_response):
+        """Create subscription consumption rate dataframe."""
         subscriptions = llm_response.get("subscriptions", [])
-
         records = []
         for sub in subscriptions:
             record = {
@@ -594,7 +569,7 @@ class ContractExtractor:
                 "subCrName": sub.get("subCrName", "NA"),
                 "subExternalId": sub.get("subExternalId", "NA"),
                 "subscriptionName": sub.get("subscriptionName", "NA"),
-                "CurrencyIsoCode": sub.get("CurrencyIsoCode", "NA"),
+                "CurrencyIsoCode": "USD",
                 "OriginalPrice__c": sub.get("OriginalPrice__c", "NA"),
                 "Price__c": sub.get("Price__c", "NA"),
                 "PricingMethod__c": "PerUnit",
@@ -604,16 +579,14 @@ class ContractExtractor:
                 "UpperBound__c": ""
             }
             records.append(record)
-
         return pd.DataFrame(records)
 
     def create_source_consumption_schedule_dataframe(self, enriched_llm_response):
+        """Create source consumption schedule dataframe."""
         subscriptions = enriched_llm_response.get("subscriptions", [])
         records = []
-
         for sub in subscriptions:
             list_items = sub.get("listitemsource", [])
-
             for item in list_items:
                 if "base configuration" in (item.get("lisName", "")).lower():
                     continue
@@ -624,22 +597,20 @@ class ContractExtractor:
                     "subscriptionName": sub.get("subscriptionName", "NA"),
                     "lisExternalId": item.get("lisExternalId", "NA"),
                     "lisName": item.get("lisName", "NA"),
-                    "CurrencyIsoCode": item.get("CurrencyIsoCode", "NA"),
+                    "CurrencyIsoCode": "USD",
                     "LineItemSource__c": "",
                     "RatingMethod__c": "Tier",
                     "Type__c": "Range"
                 }
                 records.append(record)
-
         return pd.DataFrame(records)
 
     def create_source_consumption_rate_dataframe(self, llm_response):
+        """Create source consumption rate dataframe."""
         subscriptions = llm_response.get("subscriptions", [])
         records = []
-
         for sub in subscriptions:
             list_items = sub.get("listitemsource", [])
-
             for item in list_items:
                 if "base configuration" in (item.get("lisName", "")).lower():
                     continue
@@ -650,7 +621,7 @@ class ContractExtractor:
                     "lisName": item.get("lisName", "NA"),
                     "subExternalId": sub.get("subExternalId", "NA"),
                     "subscriptionName": sub.get("subscriptionName", "NA"),
-                    "CurrencyIsoCode": item.get("CurrencyIsoCode", "NA"),
+                    "CurrencyIsoCode": "USD",
                     "OriginalPrice__c": "",
                     "Price__c": item.get("Price__c", "NA"),
                     "PricingMethod__c": "PerUnit",
@@ -660,16 +631,74 @@ class ContractExtractor:
                     "UpperBound__c": ""
                 }
                 records.append(record)
-
         return pd.DataFrame(records)
-    
-    # === TOP-LEVEL EXTRACTION ===
+
+    def get_lineitemsource_count(self, pdf):
+        """Get line item source count from PDF."""
+        pm_list = []
+        with pdfplumber.open(io.BytesIO(pdf)) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables()
+                pm_list.append(tables)
+
+        keywords = {'base', 'in base', 'additional'}
+        filtered_rows = []
+
+        for plist in pm_list:
+            if plist:
+                for pst in plist:
+                    for pt in pst:
+                        pt_lower = [item.lower() if item else '' for item in pt]
+                        if any(any(kw in itm for kw in keywords) for itm in pt_lower):
+                            if len(pt) >= 3:
+                                exclusion_list = [
+                                    "base configuration",
+                                    "identity document verification - verification with face biometrics"
+                                ]
+                                first_cell = pt[0].lower() if pt and pt[0] else ""
+                                if not any(ex in first_cell for ex in exclusion_list):
+                                    filtered_rows.append(pt)
+        return filtered_rows
+
+    def extract_subscription_rows(self, pdf):
+        """Extract subscription rows from PDF."""
+        pm_list = []
+        with pdfplumber.open(io.BytesIO(pdf)) as pdf_obj:
+            for page in pdf_obj.pages:
+                tables = page.extract_tables()
+                pm_list.append(tables)
+        subscription_rows = []
+        for plist in pm_list:
+            if plist:
+                for table in plist:
+                    for pt in table:
+                        print("Row being checked:", pt)
+                        pt_cleaned = [item.replace('\n', ' ') if item else item for item in pt]
+                        if len(pt_cleaned) >= 3:
+                            # Check if this row contains all three required columns anywhere in the row
+                            has_name = any('name' in str(cell).lower() for cell in pt_cleaned if cell)
+                            has_type = any('type' in str(cell).lower() for cell in pt_cleaned if cell)
+                            has_fee_per_query = any('fee per' in str(cell).lower() for cell in pt_cleaned if cell)
+                            
+                            if has_name and has_type and has_fee_per_query:
+                                print("   ---> Found header row with ['Name', 'Type', 'Fee per Query'] columns")
+                                print(f"   ---> Row content: {pt_cleaned}")
+                                # Count this as a subscription section
+                                subscription_rows.append(pt_cleaned)
+                            else:
+                                print(f"   ---> Skipped row - missing required columns:")
+                                print(f"      has_name: {has_name}, has_type: {has_type}, has_fee_per_query: {has_fee_per_query}")
+                        else:
+                            print("Skipped row due to insufficient columns:", pt_cleaned)
+        return subscription_rows
+
     async def extract_fields_from_text(self, full_text):
+        """Extract all fields from text."""
         contract_fields = await self.extract_contract_fields(full_text)
         try:
             boundaries = await self.call_llm_for_chunk_boundaries(full_text)
             print("\n==== LLM Country Boundaries ====")
-            print(json.dumps(boundaries, indent=2, ensure_ascii=False))  # <-- ADD THIS
+            print(json.dumps(boundaries, indent=2, ensure_ascii=False))
         except Exception as e:
             print(f"Error in chunk boundary extraction: {e}")
             boundaries = []
@@ -684,106 +713,25 @@ class ContractExtractor:
         contract_fields["subscriptions"] = batch_extracted_subs
 
         return contract_fields
-    
-    #==============VALIDATION=======================
-    ## 08/04 start of change removing in additional rows ##
-    def get_lineitemsource_count(self, pdf):
-        pm_list = []
 
-        with pdfplumber.open(io.BytesIO(pdf)) as pdf:
-            for page in pdf.pages:
-                tables = page.extract_tables()
-                pm_list.append(tables)
-
-        # Lowercase all keywords for comparison
-        keywords = {'base', 'in base', 'additional'}
-        filtered_rows = []
-
-        for plist in pm_list:
-            if plist:
-                for pst in plist:
-                    for pt in pst:
-                        # Compose a lowercased version of the row for all checks
-                        pt_lower = [item.lower() if item else '' for item in pt]
-                        # Any item matches keywords
-                        if any(any(kw in itm for kw in keywords) for itm in pt_lower):
-                            if len(pt) >= 3:
-                                # Exclude if first cell contains "base configuration" or the other special phrases
-                                exclusion_list = [
-                                    "base configuration",
-                                    "identity document verification - verification with face biometrics"
-                                ]
-                                first_cell = pt[0].lower() if pt and pt[0] else ""
-                                
-                                if not any(ex in first_cell for ex in exclusion_list):
-                                    # Check if this row contains "in additional" (case insensitive)
-                                    # Normalize text by removing \n characters first
-                                    has_in_additional = any("in additional" in cell.replace('\n', ' ').lower() for cell in pt if cell)
-                                    
-                                    if not has_in_additional:
-                                        filtered_rows.append(pt)
-                                    else:
-                                        print(f"Excluding 'in additional' row: {pt[0] if pt else 'N/A'}")
-
-        final_count = len(filtered_rows)
-        
-        print(f"=== LINE ITEM SOURCE COUNTING ===")
-        print(f"Final count (excluding in additional): {final_count}")
-        print(f"=====================================")
-        
-        return {"rows": filtered_rows, "count": final_count}
-        ## 08/04 end of change ##
-
-
-    def extract_subscription_rows(self, pdf):
-        pm_list = []
-        with pdfplumber.open(io.BytesIO(pdf)) as pdf_obj:
-            for page in pdf_obj.pages:
-                tables = page.extract_tables()
-                pm_list.append(tables)
-        subscription_rows = []
-        for plist in pm_list:  # List of tables per page
-            if plist:
-                for table in plist:  # Each table on this page
-                    for pt in table:  # Each row in this table
-                        print("Row being checked:", pt)
-                        pt_cleaned = [item.replace('\n', ' ') if item else item for item in pt]
-                        if len(pt_cleaned) >= 3:
-                            if pt_cleaned[0]:
-                                first_col_normalized = pt_cleaned[0].replace(' ', '').lower()
-                                if "baseconfiguration" in first_col_normalized:
-                                    print("   ---> Added to subscription_rows!")
-                                    subscription_rows.append(pt_cleaned)
-                            else:
-                                print("Skipped row due to empty first column:", pt_cleaned)
-
-
-        return subscription_rows
-    
-    async def extract_contract_pipeline_from_md(self, input_pdf, extracted_text, file_name):
-        """
-        extracted_text: string containing the contract markdown.
-        file_path: optional, the filename or path for logging/trace (default empty).
-        """
+    async def extract_contract_pipeline_from_md(self, extracted_text, file_path, fileName, contract_external_id):
+        """Main pipeline to extract contract data from markdown."""
+        start_time = time.time()
         result = await self.extract_fields_from_text(extracted_text)
+        extracting_end = time.time()
 
-        # if input_pdf and input_pdf.lower().endswith(".pdf"):
-        #     try:
-        lis_result = self.get_lineitemsource_count(input_pdf) ## 08/04 change
-        sub_rows = self.extract_subscription_rows(input_pdf)
-        actual_lis_cnt = lis_result["count"] ## 08/04 change
+        lis_rows = self.get_lineitemsource_count(file_path)
+        sub_rows = self.extract_subscription_rows(file_path)
+        actual_lis_cnt = len(lis_rows)
         actual_sub_cnt = len(sub_rows)
-            # except Exception as e:
-            #     print(f"Warning: Could not count LIS/SUB rows for {input_pdf}: {e}")
-            #     actual_lis_cnt = ""
-            #     actual_sub_cnt = ""
-        
+
         if not result:
             return {
                 "TimeStamp": datetime.now().isoformat(),
-                "FileName": file_name,
-                "Contractid": "",
+                "FileName": fileName,
+                "Contractid": contract_external_id,
                 "AccountName": "",
+                "TotalRunTime": round(extracting_end - start_time, 2),
                 "ActualSubCnt": "",
                 "ActualLisCnt": "",
                 "ExtractedSubCnt": "",
@@ -794,7 +742,7 @@ class ContractExtractor:
                 "output_records": []
             }
 
-        enriched_result = self.enrich_llm_response(result)
+        enriched_result = self.enrich_llm_response(result, contract_external_id)
 
         Contract = self.create_contract_dataframe(enriched_result)
         Subscription = self.create_subscription_dataframe(enriched_result)
@@ -806,9 +754,10 @@ class ContractExtractor:
 
         output_json = {
             "TimeStamp": datetime.now().isoformat(),
-            "FileName": file_name,
+             "FileName": fileName,
             "Contractid": enriched_result.get("contractExternalId", ""),
             "AccountName": enriched_result.get("AccountName", ""),
+            "TotalRunTime": round(extracting_end - start_time, 2),
             "ActualSubCnt": actual_sub_cnt,
             "ExtractedSubCnt": "",    
             "MatchedSubCnt": "",       
@@ -831,3 +780,48 @@ class ContractExtractor:
         }
 
         return output_json
+
+
+# if __name__ == "__main__":
+#     # Hardcoded inputs
+#     contract_external_id = "dummy_ext_id"
+#     input_pdf = "BACKEND/THIRDV/amendments/Plum_New_Markets_add_ons.docx.pdf"
+#     input_md = "BACKEND/THIRDV/output_json/parsed_Plum_New_Markets_add_ons.docx.md"
+#     output_folder = "BACKEND/THIRDV/output_single_json"
+
+#     if not os.path.exists(output_folder):
+#         os.makedirs(output_folder)
+
+#     # Create extractor instance
+#     extractor = ContractExtractor()
+    
+#     # Process single file
+#     filename = os.path.basename(input_md)
+#     print(f"Processing: {filename}")
+#     print(f"Using ContractExternalId: {contract_external_id}")
+
+#     with open(input_md, "r", encoding="utf-8") as f:
+#         md_str = f.read()
+
+#     all_json = extractor.extract_contract_pipeline_from_md(md_str, file_path=input_pdf, contract_external_id=contract_external_id)
+
+#     json_out = os.path.join(
+#         output_folder,
+#         f"json_{os.path.splitext(filename)[0]}.json"
+#     )
+#     with open(json_out, "w") as f:
+#         json.dump(all_json, f, indent=2)
+#     print(f"    Saved JSON to {json_out}")
+
+#     for table in all_json["output_records"]:
+#         name = table["name"]
+#         data = table["data"]
+#         if data:
+#             df = pd.DataFrame(data)
+#             csv_out = os.path.join(
+#                 output_folder,
+#                 f"{os.path.splitext(filename)[0]}_{name}.csv"
+#             )
+#             df.to_csv(csv_out, index=False)
+#     print(f"    All CSVs for {filename} saved.")
+#     print("All processing done.")
