@@ -1,10 +1,11 @@
 import json
-import logging
 import asyncio
 from openai import AsyncOpenAI
+from simple_salesforce.api import Salesforce
+from oauth2client.service_account import ServiceAccountCredentials
 from config import get_ssm_param
-from simple_salesforce import Salesforce
-
+import gspread
+import logging
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -22,6 +23,9 @@ class DocV:
         self.security_token = get_ssm_param("/myapp/sf_security_token")
         self.domain = get_ssm_param("/myapp/sf_domain")
 
+        self.gs_url = 'https://docs.google.com/spreadsheets/d/1uDA-59DhXE5rld3UBawrLb5iERNsLL8Nyd8kweSuqaw/edit?gid=309153661#gid=309153661'
+        self.creds_path = 'trulioo-413bdb6f7cd9.json'
+        
         self.DOCV_INSTRUCTION = """
         You are an intelligent field extractor. You are given a chunk of a document that may contain two relevant sections:
             1. Selected Services and Pricing: Identity Document Verification
@@ -98,7 +102,10 @@ class DocV:
                 {"role": "user", "content": user_prompt}
             ]
         )
-        data = json.loads(response.choices[0].message.content)
+        content = response.choices[0].message.content
+        if content is None:
+            return {"start_line": "", "end_line": ""}
+        data = json.loads(content)
         return data
     ## --end of new function-- ##
 
@@ -151,7 +158,9 @@ class DocV:
                         {"role": "user", "content": docv_chunk}
                     ]
                 )
-                outputs.append(json.loads(response.choices[0].message.content.strip()))
+                content = response.choices[0].message.content
+                if content is not None:
+                    outputs.append(json.loads(content.strip()))
             except Exception as e:
                 print(f"Error processing DOCV chunk: {e}")
         else:
@@ -166,16 +175,21 @@ class DocV:
         for doc in outputs:
             if "subscription" in doc:
                 for idx, subscription in enumerate(doc["subscription"], 1):
-                    # Make sure these fields are included!
                     sub_flat = {
                         "subExternalId": subscription.get("subExternalId", ""),
                         "ProductName": subscription.get("ProductName", ""),
                         "ContractExternalId": subscription.get("ContractExternalId", ""),
                         "ContractName": subscription.get("ContractName", ""),
-                        "CurrencyIsoCode": subscription.get("CurrencyIsoCode", ""),
+                        "CurrencyIsoCode": "USD",
                         "SBQQ__SubscriptionStartDate__c": subscription.get("SBQQ__SubscriptionStartDate__c", ""),
                         "ProductId": subscription.get("ProductId", ""),
-                        "Note": subscription.get("Note", "")
+                        "Note": subscription.get("Note", ""),
+                        "SBQQ__BillingFrequency__c": subscription.get("SBQQ__BillingFrequency__c", ""),
+                        "SBQQ__PricingMethod__c": subscription.get("SBQQ__PricingMethod__c", ""),
+                        "SBQQ__SubscriptionPricing__c": subscription.get("SBQQ__SubscriptionPricing__c", ""),
+                        "SBQQ__SubscriptionType__c": subscription.get("SBQQ__SubscriptionType__c", ""),
+                        "SBQQ__ChargeType__c": subscription.get("SBQQ__ChargeType__c", ""),
+                        "SBQQ__BillingType__c": subscription.get("SBQQ__BillingType__c", "")
                     }
                     subscriptions.append(sub_flat)
 
@@ -185,7 +199,7 @@ class DocV:
                         "subExternalId": subscription.get("subExternalId", ""),
                         "subscriptionName": subscription.get("ProductName", ""),
                         "subCsName": subscription.get("ProductName", "") + " Direct Consumption Schedule",
-                        "CurrencyIsoCode": subscription.get("CurrencyIsoCode", ""),
+                        "CurrencyIsoCode": "USD",
                         "RatingMethod__c":"Tier",
                         "Type__c": "Range"
                     }
@@ -198,7 +212,7 @@ class DocV:
                             "subCrName": scr.get("subCrName", ""),
                             "subExternalId": subscription.get("subExternalId", ""),
                             "subscriptionName": subscription.get("ProductName", ""),
-                            "CurrencyIsoCode": scr.get("CurrencyIsoCode", ""),
+                            "CurrencyIsoCode": "USD",
                             "Price__c": scr.get("Price__c", ""),
                             "LowerBound__c": scr.get("LowerBound__c", ""), 
                             "UpperBound__c": scr.get("UpperBound__c", ""), 
@@ -230,21 +244,42 @@ class DocV:
                 })
 
         return contract_json
-    
-    async def main(self, parsed_input, output_all_json):
-        if not isinstance(output_all_json, dict):
+
+
+    async def main(self, markdown_text, contract_json):
+        if not isinstance(contract_json, dict):
             raise TypeError("contract_json must be a Python dict (not a file path).")
 
         # Use markdown_text directly:
-        full_text = parsed_input 
+        full_text = markdown_text 
 
-        contract_data = output_all_json["output_records"][0]["data"][0]
+        contract_data = contract_json["output_records"][0]["data"][0]
         contractExternalId = contract_data.get("ContractExternalId", "")
         ContractName = contract_data.get("AccountName", "")
         StartDate = contract_data.get("StartDate", "")
 
+        # --- DocV ProductCode mapping from Google Sheet ---
+        # Set these paths/URLs as needed
+        # Extract ProductName from the contract (if present)
+        docv_product_name = None
+        # Try to get ProductName from the markdown or contract_json (fallback to None)
+        try:
+            docv_chunk = await self.extract_full_docv_chunk_by_llm(full_text)
+            outputs = await self.extract_docv_consumption_from_llm(docv_chunk)
+            if outputs and outputs[0] and 'subscription' in outputs[0] and outputs[0]['subscription']:
+                docv_product_name = outputs[0]['subscription'][0].get('ProductName')
+        except Exception:
+            docv_product_name = None
 
-        # 2. Try to query Salesforce (and ALWAYS set ProductId and Note)
+        # Look up ProductCodes from Google Sheet if ProductName matches
+        docv_product_codes = []
+        if docv_product_name:
+            docv_product_codes = self.get_docv_productcodes_from_gsheet(docv_product_name, self.gs_url, self.creds_path)
+        ## 08/04 change start (FIXING NOTES)
+        # --- Salesforce query for DocV ProductId ---
+        product_id = None
+        note = "DocV Product not found in Salesforce"  # Default note
+        ## 08/04 change end (FIXING NOTES)
         try:
             sf = Salesforce(
                 username=self.username,
@@ -252,55 +287,113 @@ class DocV:
                 security_token=self.security_token,
                 domain=self.domain
             )
-            docv_product_result = sf.query(
-                "SELECT Id, CreatedDate FROM Product2 WHERE Family = 'DocV' AND IsActive=true AND ProductCode = 'DOCV2-LGC-DEFAULT' "
-                "ORDER BY CreatedDate DESC, ProductCode DESC"
+            select_fields = (
+                "Id, Name, ProductCode, CreatedDate, SBQQ__BillingFrequency__c, SBQQ__PricingMethod__c, "
+                "SBQQ__SubscriptionPricing__c, SBQQ__SubscriptionType__c, SBQQ__ChargeType__c, SBQQ__BillingType__c"
             )
-            total = docv_product_result["totalSize"]
-            if total > 1:
-                docv_product_id = docv_product_result["records"][0]["Id"]
-                note = "Duplicate products found. Id obtained from latest CreatedDate"
-            elif total == 1:
-                docv_product_id = docv_product_result["records"][0]["Id"]
+            ## 08/04 change start (FIXING NOTES) 2
+            # Simple query - use product codes if available, otherwise default
+            product_codes_to_query = docv_product_codes if docv_product_codes else ['DOCV2-LGC-DEFAULT']
+            codes_str = ", ".join([f"'{code}'" for code in product_codes_to_query])
+            query = (
+                f"SELECT {select_fields} FROM Product2 WHERE Family = 'DocV' AND IsActive=true AND ProductCode IN ({codes_str}) "
+                "ORDER BY ProductCode, CreatedDate DESC"
+            )
+            print(f"[DEBUG] SOQL QUERY: {query}")
+            res = sf.query_all(query)
+            print(f"[DEBUG] QUERY RESULT: {json.dumps(res, indent=2, ensure_ascii=False)}")
+            
+            # Simple logic: if we found products, use the first one
+            if res["totalSize"] > 0:
+                product_id = res["records"][0]["Id"]
                 note = "Successfully Matched"
-            else:
-                docv_product_id = None
-                note = "DocV Product not found"
+                    
         except Exception as e:
-            docv_product_id = None
-            note = "Could not extract ProductId from Salesforce"
-
+            print(f"Salesforce error: {e}")
+            # Keep default note: "DocV Product not found in Salesforce"
         
-        ## Updated lines
-        # 4. Extract the DOCV chunk
-        #docv_chunk = extract_full_docv_chunk(full_text)
-        docv_chunk = await self.extract_full_docv_chunk_by_llm(full_text)
-
-
-        # 5. Get LLM extraction
-        #outputs = extract_docv_consumption_from_llm(docv_chunk)
-        outputs = await self.extract_docv_consumption_from_llm(docv_chunk)
-
-        ## --end of updated lines 
-        # 6. Add custom fields (these will ALWAYS be present)
+        # Handle case where no DocV section was found
+        if not docv_chunk or not outputs or not outputs[0] or 'subscription' not in outputs[0] or not outputs[0]['subscription']:
+            # No DocV section found - return the original contract_json without adding any DocV records
+            print(f"[DEBUG] No DocV section found in document for contract {contractExternalId}")
+            return contract_json
+        
+        ## 08/04 change end (FIXING NOTES) 2
+        # --- Expand subscriptions for multiple product codes ---
+        expanded_outputs = []
         for doc in outputs:
             if "subscription" in doc:
-                for subscription in doc["subscription"]:
-                    subscription["subExternalId"] = f"docv_sub_{contractExternalId}"
+                new_doc = {"subscription": []}
+                for idx, subscription in enumerate(doc["subscription"], 1):
+                    name = subscription.get("ProductName", "")
+                    codes = docv_product_codes if docv_product_codes else []
+                    if codes:
+                        for code in codes:
+                            sub_copy = subscription.copy()
+                            sub_copy["_ProductCodeFromSheet"] = code  # for debug
+                            new_doc["subscription"].append(sub_copy)
+                    else:
+                        new_doc["subscription"].append(subscription)
+                expanded_outputs.append(new_doc)
+            else:
+                expanded_outputs.append(doc)
+        outputs = expanded_outputs
+        # 6. Add custom fields (these will ALWAYS be present)
+        extra_fields = [
+            "SBQQ__BillingFrequency__c",
+            "SBQQ__PricingMethod__c",
+            "SBQQ__SubscriptionPricing__c",
+            "SBQQ__SubscriptionType__c",
+            "SBQQ__ChargeType__c",
+            "SBQQ__BillingType__c"
+        ]
+        for doc in outputs:
+            if "subscription" in doc:
+                for idx, subscription in enumerate(doc["subscription"], 1):
+                    subscription["subExternalId"] = f"docv_sub_{idx}_{contractExternalId}"
                     subscription["ContractExternalId"] = contractExternalId
                     subscription["ContractName"] = ContractName
                     subscription["SBQQ__SubscriptionStartDate__c"] = StartDate
-                    subscription["subCsExternalId"] = f"docv_subcs_{contractExternalId}"
-                    subscription["ProductId"] = docv_product_id
+                    subscription["subCsExternalId"] = f"docv_subcs_{idx}_{contractExternalId}"
+                    ## 08/04 change start (FIXING NOTES) 3
+                    subscription["ProductId"] = product_id
                     subscription["Note"] = note
+                    ## 08/04 change end (FIXING NOTES) 3
+                    for f in extra_fields:
+                        subscription[f] = ""  # Optionally fill with actual values if needed
                     if "scr" in subscription:
                         for i, scr in enumerate(subscription["scr"], 1):
-                            scr["subCrExternalId"] = f"doc_v_subcr{i}_{contractExternalId}"
+                            scr["subCrExternalId"] = f"docv_subcr_{idx}_{contractExternalId}"
 
         # 7. Transform to requested output structure
         transformed = self.transform_to_flat_records(outputs)
 
         # 8. Merge extracted data into contract_json
-        merged = self.merge_into_contract_json(output_all_json, transformed)
+        merged = self.merge_into_contract_json(contract_json, transformed)
 
-        return merged 
+        return merged
+    
+
+    # --- Google Sheet logic for DocV ProductCode mapping ---
+    def get_docv_productcodes_from_gsheet(self, product_name, gsheet_url, creds_json_path):
+        """
+        Looks up the ProductName in the 'WL and DocV' sheet (first column). Returns a list of all ProductCodes (second column) for all matching rows.
+        Returns [] if not found or error.
+        """
+        try:
+            scopes = [
+                'https://spreadsheets.google.com/feeds',
+                'https://www.googleapis.com/auth/drive',
+            ]
+            creds = ServiceAccountCredentials.from_json_keyfile_name(creds_json_path, scopes)  # type: ignore
+            client = gspread.authorize(creds)  # type: ignore
+            sheet = client.open_by_url(gsheet_url).worksheet('WL and DocV')
+            data = sheet.get_all_values()
+            codes = []
+            for row in data[1:]:  # skip header
+                if row and row[0].strip() == product_name.strip() and len(row) > 1:
+                    codes.append(row[1].strip())
+            return codes
+        except Exception as e:
+            print(f"[DocV GSheet] Error: {e}")
+        return []

@@ -1,9 +1,7 @@
 import json
-import logging
 import asyncio
 from openai import AsyncOpenAI
 from config import get_ssm_param
-from simple_salesforce import Salesforce
 
 class Wflow:
 
@@ -28,8 +26,7 @@ class Wflow:
         ## `subscription` (subscription level fields)
         From Section: Selected Services and Pricing: Workflow Studio
             - `ProductName`: Extract the value under the column Item Name. (One ItemName is one ProductName under Subscription)
-            - `CurrencyIsoCode`: get the ISO currency code from the “Fee per Query” column.
-                - If "$", it is automatically USD. 
+            - `CurrencyIsoCode`: always "USD". Do not put NA.
 
         ##  `scr` (subscription consumption rate for this subscription)
         For each ProductName above, find the corresponding pricing details from the section for the above Item Name, extract:
@@ -37,8 +34,8 @@ class Wflow:
             - `LowerBound__c`: The monthly volume lower bound for tiered pricing (Including 0). Always use "1" if the price is not dependent on a range or waived. 
             - `UpperBound__c`: The monthly volume upper bound for pricing. Use "NA" if none or not dependent on range or price is waived.
             - `Price__c`: The value from the "Fee per Query" column (without currency, 0 if Waived or no value)
-            - `CurrencyIsoCode`: the currency under the "Fee per Query" column. If "$", it is automatically USD. 
-
+            - `CurrencyIsoCode`: always "USD". Do not put NA.
+            
         Return the extracted data as a structured JSON object, formatted as follows:
         ```json
         {
@@ -93,7 +90,10 @@ class Wflow:
                 {"role": "user", "content": user_prompt}
             ]
         )
-        data = json.loads(response.choices[0].message.content)
+        content = response.choices[0].message.content
+        if content is None:
+            return {"start_line": "", "end_line": ""}
+        data = json.loads(content)
         return data
 
     async def extract_full_workflowstudio_chunk_by_llm(self, full_text):
@@ -145,7 +145,9 @@ class Wflow:
                         {"role": "user", "content": chunk}
                     ]
                 )
-                outputs.append(json.loads(response.choices[0].message.content.strip()))
+                content = response.choices[0].message.content
+                if content is not None:
+                    outputs.append(json.loads(content.strip()))
             except Exception as e:
                 print(f"Error processing Workflow Studio chunk: {e}")
         else:
@@ -162,15 +164,15 @@ class Wflow:
         for doc in outputs:
             if "subscription" in doc:
                 for idx, subscription in enumerate(doc["subscription"], 1):
-                    subExternalId = f"wfstudio_sub_{contractExternalId}"
-                    subCsExternalId = f"wfstudio_subcs_{contractExternalId}"
+                    subExternalId = f"wfstudio_sub_{idx}_{contractExternalId}"
+                    subCsExternalId = f"wfstudio_subcs_{idx}_{contractExternalId}"
                     # Subscription-level flat
                     sub_flat = {
                         "subExternalId": subExternalId,
                         "ProductName": subscription.get("ProductName", ""),
                         "ContractExternalId": contractExternalId,
                         "ContractName": ContractName,
-                        "CurrencyIsoCode": subscription.get("CurrencyIsoCode", ""),
+                        "CurrencyIsoCode": "USD",
                         "SBQQ__SubscriptionStartDate__c": StartDate,
                         "ProductId": product_id,
                         "Note": note
@@ -182,20 +184,20 @@ class Wflow:
                         "subExternalId": subExternalId,
                         "subscriptionName": subscription.get("ProductName", ""),
                         "subCsName": subscription.get("ProductName", "") + " Direct Consumption Schedule",
-                        "CurrencyIsoCode": subscription.get("CurrencyIsoCode", ""),
+                        "CurrencyIsoCode": "USD",
                         "RatingMethod__c": "Tier",
                         "Type__c": "Range"
                     }
                     sub_cs.append(sub_cs_flat)
 
                     for i, scr in enumerate(subscription.get("scr", []), 1):
-                        subCrExternalId = f"wfstudio_subcr{i}_{contractExternalId}"
+                        subCrExternalId = f"wfstudio_subcr_{idx}_{contractExternalId}"
                         sub_cr_flat = {
                             "subCrExternalId": subCrExternalId,
                             "subCrName": scr.get("subCrName", ""),
                             "subExternalId": subExternalId,
                             "subscriptionName": subscription.get("ProductName", ""),
-                            "CurrencyIsoCode": scr.get("CurrencyIsoCode", ""),
+                            "CurrencyIsoCode": "USD",
                             "Price__c": scr.get("Price__c", ""),
                             "LowerBound__c": scr.get("LowerBound__c", ""),
                             "UpperBound__c": scr.get("UpperBound__c", ""),
@@ -285,14 +287,15 @@ class Wflow:
                     sub["Note"] = "Product not found"
 
 
-    async def main(self, parsed_input, output_all_json):
+    async def main(self, markdown_text, contract_json):
+        from simple_salesforce.api import Salesforce
 
         # 0. Sanity check
-        if not isinstance(output_all_json, dict):
+        if not isinstance(contract_json, dict):
             raise TypeError("contract_json must be a Python dict (not a file path).")
-        full_text = parsed_input
+        full_text = markdown_text
 
-        contract_data = output_all_json["output_records"][0]["data"][0]
+        contract_data = contract_json["output_records"][0]["data"][0]
         contractExternalId = contract_data.get("ContractExternalId", "")
         ContractName = contract_data.get("AccountName", "")
         StartDate = contract_data.get("StartDate", "")
@@ -315,6 +318,7 @@ class Wflow:
 
         # 3. Query Salesforce for all names (including mapped ones)
         try:
+            from simple_salesforce.api import Salesforce
             sf = Salesforce(
                 username=self.username,
                 password=self.password,
@@ -343,5 +347,5 @@ class Wflow:
                 self.update_subscription_product_fields(section["data"], product_field_map)
 
         # 6. Merge into contract_json as usual
-        merged = self.merge_into_contract_json(output_all_json, transformed)
+        merged = self.merge_into_contract_json(contract_json, transformed)
         return merged

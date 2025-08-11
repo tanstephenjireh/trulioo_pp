@@ -10,6 +10,8 @@ from docv import DocV
 from watchlist import Watchlist
 from fraud import Fraud
 from workflow import Wflow
+from kyb import KYB
+from electronic_id import ElectronicId
 from discount_schedule import DiscountSchedule
 from validation import Validation
 
@@ -44,6 +46,8 @@ async def extract_data(event, context):  # Make this async
         watchlist = Watchlist()
         fraud = Fraud()
         Workflow = Wflow()
+        kyb = KYB()
+        electronic_id = ElectronicId()
         discount_schedule = DiscountSchedule()
         validation = Validation()
 
@@ -86,8 +90,8 @@ async def extract_data(event, context):  # Make this async
         try:
             print("STEP: DOCV")
             docv_all_json = await doc_v.main(  # Add await if needed
-                parsed_input=parsed_content,
-                output_all_json=output_all_json
+                markdown_text=parsed_content,
+                contract_json=output_all_json
             )
         except Exception as e:
             print(f"ERROR in DOCV step: {e}")
@@ -96,8 +100,8 @@ async def extract_data(event, context):  # Make this async
         try:
             print("STEP: Watchlist")
             watchlist_all_json = await watchlist.main(  # Add await if needed
-                parsed_input=parsed_content,
-                output_all_json=docv_all_json
+                markdown_text=parsed_content,
+                contract_json=docv_all_json
             )
         except Exception as e:
             print(f"ERROR in Watchlist step: {e}")
@@ -106,8 +110,8 @@ async def extract_data(event, context):  # Make this async
         try:
             print("STEP: FraudIntelligence")
             fraud_all_json = await fraud.main(  # Add await if needed
-                parsed_input=parsed_content,
-                output_all_json=watchlist_all_json
+                input_md=parsed_content,
+                input_contract_json=watchlist_all_json
             )
         except Exception as e:
             print(f"ERROR in FraudIntelligence step: {e}")
@@ -116,23 +120,37 @@ async def extract_data(event, context):  # Make this async
         try:
             print("STEP: WorkflowStudio")
             workflow_all_json = await Workflow.main(  # Add await if needed
-                parsed_input=parsed_content,
-                output_all_json=fraud_all_json
+                markdown_text=parsed_content,
+                contract_json=fraud_all_json
             )
         except Exception as e:
             print(f"ERROR in WorkflowStudio step: {e}")
             raise
 
         try:
+            print("STEP: KYB")
+            kyb_json = await kyb.main(parsed_content, workflow_all_json)
+        except Exception as e:
+            print(f"ERROR in KYB step: {e}")
+            raise
+
+        try:
+            print("STEP: ElectronicID")
+            electronic_id_json = await electronic_id.main(parsed_content, kyb_json)
+        except Exception as e:
+            print(f"ERROR in ElectronicID step: {e}")
+            raise
+
+        try:
             print("STEP: Discount Schedule")
-            discount_json = await discount_schedule.main(parsed_content, workflow_all_json)
+            discount_json = await discount_schedule.main(parsed_content, electronic_id_json)
         except Exception as e:
             print(f"ERROR in Discount Schedule step: {e}")
             raise
 
         try:
             print("STEP: Validation")
-            final_json = validation.run_validation(pdf_content, discount_json)
+            final_json = validation.main(discount_json, parsed_content, pdf_content)
         except Exception as e:
             print(f"ERROR in Validation step: {e}")
             raise

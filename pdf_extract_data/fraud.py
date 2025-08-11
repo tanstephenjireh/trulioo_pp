@@ -1,9 +1,9 @@
 import json
-import logging
 import asyncio
 from openai import AsyncOpenAI
 from config import get_ssm_param
-from simple_salesforce import Salesforce
+from simple_salesforce.api import Salesforce
+import logging
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -76,10 +76,11 @@ class Fraud:
         """
         system_prompt = (
             "You are an expert contract parser. "
-            "Your job is to find the exact line text that marks the START and END of the Fraud Intelligence section in the contract below."
+            "Your job is to find the exact line text that marks the START and END of the Fraud Intelligence section in the contract below, if present"
         )
         user_prompt = f"""
     # Instructions:
+    - Check if the document has a Fraud Intelligence section and get the start_line and end_line, only if the section exists.
     ### START OF FRAUD INTELLIGENCE ###
     - Find the line that marks the START of the Fraud Intelligence block. This may be a line containing 'Selected Services and Pricing: Fraud Intelligence'.
         - A Fraud Intelligence block may also be associated with sections like '# Fraud Intelligence – Person Fraud Tier Pricing' or '# Fraud Intelligence – Person Fraud Surcharge'.
@@ -104,7 +105,10 @@ class Fraud:
                 {"role": "user", "content": user_prompt}
             ]
         )
-        data = json.loads(response.choices[0].message.content)
+        content = response.choices[0].message.content
+        if content is None:
+            return {"start_line": "", "end_line": ""}
+        data = json.loads(content)
         return data
 
     async def extract_full_fraud_chunk_by_llm(self, full_text):
@@ -141,6 +145,9 @@ class Fraud:
         outputs = []
         if fraud_chunk.strip():
             try:
+                # Add delay before API call
+                await asyncio.sleep(1)
+
                 response = await self.openai.chat.completions.create(
                     model="gpt-4.1-mini",
                     temperature=0.0,
@@ -150,7 +157,9 @@ class Fraud:
                         {"role": "user", "content": fraud_chunk}
                     ]
                 )
-                outputs.append(json.loads(response.choices[0].message.content.strip()))
+                content = response.choices[0].message.content
+                if content is not None:
+                    outputs.append(json.loads(content.strip()))
             except Exception as e:
                 print(f"Error processing FRAUD chunk: {e}")
         else:
@@ -170,7 +179,7 @@ class Fraud:
                         "ProductName": subscription.get("ProductName", ""),
                         "ContractExternalId": subscription.get("ContractExternalId", ""),
                         "ContractName": subscription.get("ContractName", ""),
-                        "CurrencyIsoCode": subscription.get("CurrencyIsoCode", ""),
+                        "CurrencyIsoCode": "USD",
                         "SBQQ__SubscriptionStartDate__c": subscription.get("SBQQ__SubscriptionStartDate__c", ""),
                         "ProductId": subscription.get("ProductId", ""),
                         "Note": subscription.get("Note", "")
@@ -182,7 +191,7 @@ class Fraud:
                         "subExternalId": subscription.get("subExternalId", ""),
                         "subscriptionName": subscription.get("ProductName", ""),
                         "subCsName": subscription.get("ProductName", "") + " Direct Consumption Schedule",
-                        "CurrencyIsoCode": subscription.get("CurrencyIsoCode", ""),
+                        "CurrencyIsoCode": "USD",
                         "RatingMethod__c":"Tier",
                         "Type__c": "Range"
                     }
@@ -194,7 +203,7 @@ class Fraud:
                             "subCrName": scr.get("subCrName", ""),
                             "subExternalId": subscription.get("subExternalId", ""),
                             "subscriptionName": subscription.get("ProductName", ""),
-                            "CurrencyIsoCode": scr.get("CurrencyIsoCode", ""),
+                            "CurrencyIsoCode": "USD",
                             "Price__c": scr.get("Price__c", ""),
                             "LowerBound__c": scr.get("LowerBound__c", ""),
                             "UpperBound__c": scr.get("UpperBound__c", ""),
@@ -222,22 +231,23 @@ class Fraud:
                 })
         return contract_json
 
-    async def main(self, parsed_input, output_all_json):
+    async def main(self, input_md, input_contract_json):
         # 1. Read contract info
-    
-        contract_data = output_all_json["output_records"][0]["data"][0]
+        contract_data = input_contract_json["output_records"][0]["data"][0]
         contractExternalId = contract_data.get("ContractExternalId", "")
         ContractName = contract_data.get("AccountName", "")
         StartDate = contract_data.get("StartDate", "")
 
         # 2. Read extracted markdown file
-        full_text = parsed_input 
+        full_text = input_md 
 
         # 3. Extract the Fraud chunk
         fraud_chunk = await self.extract_full_fraud_chunk_by_llm(full_text)
         # 4. Get LLM extraction
         outputs = await self.extract_fraud_consumption_from_llm(fraud_chunk)
-        # 5. Hardcoded Salesforce query for 'Fraud Intelligence - Person Fraud'
+
+        # 5. Salesforce query for 'Fraud Intelligence - Person Fraud'
+        fraud_field_map = {}
         fraud_product_id = None
         note = "Product not found"
         try:
@@ -247,20 +257,33 @@ class Fraud:
                 security_token=self.security_token,
                 domain=self.domain
             )
-            query = "SELECT Id FROM Product2 WHERE Name = 'Fraud Intelligence - Person Fraud' AND IsActive = true"
+            query = (
+                "SELECT Id, Name, CreatedDate, SBQQ__BillingFrequency__c, SBQQ__PricingMethod__c, "
+                "SBQQ__SubscriptionPricing__c, SBQQ__SubscriptionType__c, SBQQ__ChargeType__c, SBQQ__BillingType__c "
+                "FROM Product2 WHERE Name = 'Fraud Intelligence - Person Fraud' AND IsActive = true "
+                "ORDER BY CreatedDate DESC"
+            )
+            print(f"[DEBUG] FRAUD SOQL QUERY: {query}")
             res = sf.query(query)
             if res["totalSize"] > 0:
+                for r in res["records"]:
+                    fraud_field_map[r["Name"]] = r
                 fraud_product_id = res["records"][0]["Id"]
-                note = "Successfully Matched"
+                note = "Successfully Matched" if res["totalSize"] == 1 else "Duplicate products found. Id obtained from latest CreatedDate"
             else:
-                fraud_product_id = None
                 note = "Product not found"
         except Exception as e:
-            print(f"Salesforce Query Exception: {e}")
-            fraud_product_id = None
             note = "Could not extract ProductId from Salesforce"
 
-        # 6. Add custom fields to ALL subscriptions
+        # 6. Add custom fields to ALL subscriptions (like workflow.py)
+        extra_fields = [
+            "SBQQ__BillingFrequency__c",
+            "SBQQ__PricingMethod__c",
+            "SBQQ__SubscriptionPricing__c",
+            "SBQQ__SubscriptionType__c",
+            "SBQQ__ChargeType__c",
+            "SBQQ__BillingType__c"
+        ]
         sub_count = 1
         for doc in outputs:
             if "subscription" in doc:
@@ -270,8 +293,12 @@ class Fraud:
                     subscription["ContractName"] = ContractName
                     subscription["SBQQ__SubscriptionStartDate__c"] = StartDate
                     subscription["subCsExternalId"] = f"fraud_subcs_{sub_count}_{contractExternalId}"
-                    subscription["ProductId"] = fraud_product_id      # <--- use the single looked-up value
-                    subscription["Note"] = note                      # <--- use the single looked-up value
+                    # Set ProductId and custom fields from fraud_field_map
+                    fraud_record = fraud_field_map.get(subscription.get("ProductName", ""), {})
+                    subscription["ProductId"] = fraud_record.get("Id", "")
+                    for f in extra_fields:
+                        subscription[f] = fraud_record.get(f, "")
+                    subscription["Note"] = note if not fraud_record else ("Successfully Matched" if res["totalSize"] == 1 else "Duplicate products found. Id obtained from latest CreatedDate")
                     if "scr" in subscription:
                         for i, scr in enumerate(subscription["scr"], 1):
                             scr["subCrExternalId"] = f"fraud_subcr{sub_count}_{i}_{contractExternalId}"
@@ -280,5 +307,5 @@ class Fraud:
         # 7. Transform to requested output structure
         transformed = self.transform_to_flat_records(outputs)
         # 8. Merge extracted data into contract_json
-        merged = self.merge_into_contract_json(output_all_json, transformed)
+        merged = self.merge_into_contract_json(input_contract_json, transformed)
         return merged

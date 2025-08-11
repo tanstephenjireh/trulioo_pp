@@ -71,61 +71,6 @@ class ContractExtractor:
 
         """
 
-        self.SUBSCRIPTION_INSTRUCTIONS = """
-        You are an intelligent field extractor. You are given a document containing a single **subscription block** for a specific country. Your task is to extract the relevant subscription and list item fields, and return a structured JSON object in the following format:
-
-        ```json
-        {
-        "subscriptions": [
-            {
-            <Subscription-level fields>,
-            "listitemsource": [ ...list items for this subscription... ]
-            }
-        ]
-        }
-        ```
-
-        If a value is not present, return \"NA\". Do not leave any field blank.
-
-        IMPORTANT: Always use the exact country name as it appears in the input document for the subscriptionName field. Do not abbreviate, translate, or normalize it.
-        ---
-
-        ## `subscriptions` (list of subscription blocks grouped by country)
-
-        **For each subscription**, extract the following:
-
-        - `subscriptionName`: the country where this subscription applies
-        - `CurrencyIsoCode`: the currency used in the "Fee per Query" rows of this subscription.
-            - If "$", it is automatically USD. Do not base currency on country.
-        - `subCsName`: set as `"<subscriptionName> Transactions - Direct Consumption Schedules"`
-        - `subCrName`: set as `"<subscriptionName> Transactions - Consumption Rate"`
-        -  Price__c: the numeric value of the "Fee per Query" for the Base Configuration in the subscription block (usually the first row). NA if there is no Base Configuration.
-        ---
-
-        ### `listitemsource` (inside each subscription block)
-
-        This is a list of rows representing the selected services under each subscription block.
-
-        **Each row represents an item listed under the "Selected Services and Pricing: Person Match" section of the document.**
-
-        For each row, extract:
-
-        - `lisName`: from the "Name" field of the row
-        - `BaseAddon__c`:  
-        - "Base" if Type is "Base" or "In-Base"  
-        - "Add-On" if Type is "In Additional" or "Additional"
-        - `CurrencyIsoCode`: the currency under the "Fee per Query" column
-            - If "$", it is automatically USD. Do not base currency on country.
-        - `Description__c`: from the "Comments" column
-        - `Included__c`:  
-        - "TRUE" if the "Fee per Query" is marked "Included"  
-        - "FALSE" otherwise
-        - `scsName`: set as `"<lisName> Consumption Schedule"`
-        - `scrName`: set as `"<lisName> Consumption Rate"`
-        - `Price__c`: the numeric value from "Fee per Query", or 0 if "Included"
-        """
-    
-
     # ========== FIELD EXTRACTION LOGIC ==========
 
 #############################################################################################
@@ -320,13 +265,14 @@ class ContractExtractor:
     ## `subscriptions` (list of subscription blocks grouped by country)
     **For each subscription**, extract the following:
 
-    - `subscriptionName`: the country where this subscription applies
-    - `CurrencyIsoCode`: the currency ISO code used in the "Fee per Query" rows of this subscription.
-        - If "$", it is automatically USD. Do not base currency on country.
+    - `subscriptionName`: the country where this subscription applies. 
+        - This should be a valid country name.
+        - If there are extra words or phrases after the country name, remove, and only return the country name. (e.g. "Japan" NOT "Japan Configuration")
+    - `CurrencyIsoCode`: always "USD"
     - `subCsName`: set as `"<subscriptionName> Transactions - Direct Consumption Schedules"`
     - `subCrName`: set as `"<subscriptionName> Transactions - Consumption Rate"`
     - `Price__c`: the numeric value of the "Fee per Query" for the Base Configuration in the subscription block (usually the first row). NA if there is no Base Configuration.
-
+    - `HasBaseConfiguration`: True if one row under a subscription block has the words 'Base Configuration' under the Name items, else false. (example: "Base Configuration", "Canada Base Configuration")
     ---
 
     ### `listitemsource` (inside each subscription block)
@@ -338,9 +284,9 @@ class ContractExtractor:
     - `lisName`: from the "Name" field of the row
     - `BaseAddon__c`:  
     - "Base" if Type is "Base" or "In-Base"  
-    - "Add-On" if Type is "In Additional" or "Additional"
-    - `CurrencyIsoCode`: the currency under the "Fee per Query" column
-        - If "$", it is automatically USD. Do not base currency on country.
+    - "Add-On" if Type is "Additional"
+    - "In Additional" if Type is "In Additional"
+    - `CurrencyIsoCode`: always "USD"
     - `Description__c`: from the "Comments" column
     - `Included__c`:  
     - "TRUE" if the "Fee per Query" is marked "Included"  
@@ -404,7 +350,28 @@ class ContractExtractor:
         llm_response["contractExternalId"] = contractExternalId
 
         subscriptions = llm_response.get("subscriptions", [])
+        valid_subscriptions = []  ## 07/30 NEW LINE 0
+        
         for i, subscription in enumerate(subscriptions, start=1):
+            subscription_name = subscription.get("subscriptionName", "NA")
+            if subscription_name != "NA":
+                unwanted_words = r'\b(?:General|Country:|Configuration|Fee|Pricing|Information|country|base configuration|table|details|services|structure)\b'
+                subscription_name = re.sub(unwanted_words, '', subscription_name, flags=re.IGNORECASE).strip()
+                subscription_name = re.sub(r'\s+', ' ', subscription_name).strip()
+                if not subscription_name:
+                    subscription_name = "NA"
+            
+            # Update the subscription with filtered name
+            subscription["subscriptionName"] = subscription_name
+            
+            ## 07/30 new lines 1
+            # Skip subscriptions with blank/NA subscriptionName
+            if subscription_name == "NA" or not subscription_name.strip():
+                print(f"Skipping subscription {i}: blank subscriptionName")
+                continue
+            ## end of 07/30 new lines 1
+            
+            # Only assign external IDs to valid subscriptions
             sub_external_id = f"sub{i}_{contractExternalId}"
             subcs_external_id = f"subcs{i}_{contractExternalId}"
             subcr_external_id = f"subcr{i}_{contractExternalId}"
@@ -412,18 +379,39 @@ class ContractExtractor:
             subscription["subExternalId"] = sub_external_id
             subscription["subCsExternalId"] = subcs_external_id
             subscription["subCrExternalId"] = subcr_external_id
-
+        
+            ## 07/30 new lines 2
+            # Filter out invalid list items
+            valid_list_items = []
             non_base_count = 1
             for item in subscription.get("listitemsource", []):
-                if "base configuration" in item.get("lisName", "").strip().lower():
+                lis_name = item.get("lisName", "NA")
+                
+                # Skip base configuration items
+                if "base configuration" in lis_name.strip().lower():
                     continue
+                    
+                # Skip items with blank/NA lisName
+                if lis_name == "NA" or not lis_name.strip():
+                    print(f"Skipping list item in subscription {i}: blank lisName")
+                    continue
+                
+                # Only assign external IDs to valid list items
                 item["lisExternalId"] = f"lis{non_base_count}_{sub_external_id}"
                 item["scsExternalId"] = f"scs{non_base_count}_{sub_external_id}"
                 item["scrExternalId"] = f"scr{non_base_count}_{sub_external_id}"
                 non_base_count += 1
+                valid_list_items.append(item)
+            
+            # Update subscription with only valid list items
+            subscription["listitemsource"] = valid_list_items
+            valid_subscriptions.append(subscription)
 
-        contractExternalId = llm_response.get("contractExternalId", "NA")
+        # Update llm_response with only valid subscriptions
+        llm_response["subscriptions"] = valid_subscriptions
 
+        ## 07/30 end of modified lines 2
+        
         return llm_response
     
     # === CREATION OF DATAFRAMES ===
@@ -510,29 +498,52 @@ class ContractExtractor:
                 "SBQQ__RequiredById__c": "",
                 "SBQQ__RequiredByProduct__c": "",
                 "SBQQ__SubscriptionPricing__c": "",
-                "SBQQ__SubscriptionType__c": ""
+                "SBQQ__SubscriptionType__c": "",
+                "HasBaseConfiguration": entry.get("HasBaseConfiguration", "NA") ## 08/04 change added BC flag
             }
             records.append(record)
 
         return pd.DataFrame(records)
     
     def create_line_item_source_dataframe(self, llm_response):
+        ## 08/04 change start (duplicate removal)
         subscriptions = llm_response.get("subscriptions", [])
 
         records = []
+        seen_pairs = set()  # Track seen (lisName, subExternalId) pairs
+        duplicate_count = 0
+        
         for sub in subscriptions:
             list_items = sub.get("listitemsource", [])
             for item in list_items:
                 if "base configuration" in (item.get("lisName", "")).lower():
                     continue
+                # Skip "In Additional" items to match Salesforce enrichment logic
+                if item.get("BaseAddon__c") == "In Additional":
+                    continue 
+
+                lis_name = item.get("lisName", "NA")
+                sub_external_id = sub.get("subExternalId", "NA")
+                
+                # Create unique pair for duplicate checking
+                pair_key = (lis_name, sub_external_id)
+                
+                # Skip if this pair has already been seen
+                if pair_key in seen_pairs:
+                    duplicate_count += 1
+                    print(f"Removing duplicate LineItemSource: lisName='{lis_name}', subExternalId='{sub_external_id}'")
+                    continue
+                
+                # Add to seen pairs
+                seen_pairs.add(pair_key)
 
                 record = {
                     "lisExternalId": item.get("lisExternalId", "NA"),
-                    "lisName": item.get("lisName", "NA"),
-                    "subExternalId": sub.get("subExternalId", "NA"),
+                    "lisName": lis_name,
+                    "subExternalId": sub_external_id,
                     "subscriptionName": sub.get("subscriptionName", "NA"),
                     "BaseAddon__c": item.get("BaseAddon__c", "NA"),
-                    "CurrencyIsoCode": item.get("CurrencyIsoCode", "NA"),
+                    "CurrencyIsoCode": "USD",
                     "Description__c": item.get("Description__c", "NA"),
                     "EndDate__c": "",
                     "Included__c": item.get("Included__c", "NA"),
@@ -546,7 +557,13 @@ class ContractExtractor:
                 }
                 records.append(record)
 
+        print(f"=== LINE ITEM SOURCE DUPLICATE REMOVAL ===")
+        print(f"Total duplicates removed: {duplicate_count}")
+        print(f"Final unique records: {len(records)}")
+        print(f"==========================================")
+
         return pd.DataFrame(records)
+    ## 08/04 change end (duplicate removal)
     
     def create_subscription_consumption_schedule_dataframe(self, llm_response):
         subscriptions = llm_response.get("subscriptions", [])
@@ -669,6 +686,7 @@ class ContractExtractor:
         return contract_fields
     
     #==============VALIDATION=======================
+    ## 08/04 start of change removing in additional rows ##
     def get_lineitemsource_count(self, pdf):
         pm_list = []
 
@@ -678,7 +696,7 @@ class ContractExtractor:
                 pm_list.append(tables)
 
         # Lowercase all keywords for comparison
-        keywords = {'base', 'in base', 'in additional', 'additional'}
+        keywords = {'base', 'in base', 'additional'}
         filtered_rows = []
 
         for plist in pm_list:
@@ -696,10 +714,25 @@ class ContractExtractor:
                                     "identity document verification - verification with face biometrics"
                                 ]
                                 first_cell = pt[0].lower() if pt and pt[0] else ""
+                                
                                 if not any(ex in first_cell for ex in exclusion_list):
-                                    filtered_rows.append(pt)
+                                    # Check if this row contains "in additional" (case insensitive)
+                                    # Normalize text by removing \n characters first
+                                    has_in_additional = any("in additional" in cell.replace('\n', ' ').lower() for cell in pt if cell)
+                                    
+                                    if not has_in_additional:
+                                        filtered_rows.append(pt)
+                                    else:
+                                        print(f"Excluding 'in additional' row: {pt[0] if pt else 'N/A'}")
 
-        return filtered_rows
+        final_count = len(filtered_rows)
+        
+        print(f"=== LINE ITEM SOURCE COUNTING ===")
+        print(f"Final count (excluding in additional): {final_count}")
+        print(f"=====================================")
+        
+        return {"rows": filtered_rows, "count": final_count}
+        ## 08/04 end of change ##
 
 
     def extract_subscription_rows(self, pdf):
@@ -736,9 +769,9 @@ class ContractExtractor:
 
         # if input_pdf and input_pdf.lower().endswith(".pdf"):
         #     try:
-        lis_rows = self.get_lineitemsource_count(input_pdf)
+        lis_result = self.get_lineitemsource_count(input_pdf) ## 08/04 change
         sub_rows = self.extract_subscription_rows(input_pdf)
-        actual_lis_cnt = len(lis_rows)
+        actual_lis_cnt = lis_result["count"] ## 08/04 change
         actual_sub_cnt = len(sub_rows)
             # except Exception as e:
             #     print(f"Warning: Could not count LIS/SUB rows for {input_pdf}: {e}")
@@ -768,7 +801,7 @@ class ContractExtractor:
         LineItemSource = self.create_line_item_source_dataframe(enriched_result)
         subConsumptionSchedule = self.create_subscription_consumption_schedule_dataframe(enriched_result)
         subConsumptionRate = self.create_subscription_consumption_rate_dataframe(enriched_result)
-        lisConsmptionSchedule = self.create_source_consumption_schedule_dataframe(enriched_result)
+        lisConsumptionSchedule = self.create_source_consumption_schedule_dataframe(enriched_result)
         lisConsumptionRate = self.create_source_consumption_rate_dataframe(enriched_result)
 
         output_json = {
@@ -792,7 +825,7 @@ class ContractExtractor:
                 {"name": "LineItemSource", "data": LineItemSource.to_dict(orient="records")},
                 {"name": "subConsumptionSchedule", "data": subConsumptionSchedule.to_dict(orient="records")},
                 {"name": "subConsumptionRate", "data": subConsumptionRate.to_dict(orient="records")},
-                {"name": "lisConsmptionSchedule", "data": lisConsmptionSchedule.to_dict(orient="records")},
+                {"name": "lisConsumptionSchedule", "data": lisConsumptionSchedule.to_dict(orient="records")},
                 {"name": "lisConsumptionRate", "data": lisConsumptionRate.to_dict(orient="records")}
             ]
         }
