@@ -6,6 +6,7 @@ import logging
 import asyncio
 import base64
 import time
+import random
 
 from amd_main import AmendmentPipeline
 
@@ -15,6 +16,56 @@ logger.setLevel(logging.INFO)
 ## 1. Get the dataframe.json file saved in S3
 ## 2. Run the whole extraction pipeline
 ## 3. Append the new items from appendents to the matched account name
+
+async def run_pipeline_with_retry(amd_main, external_id_file, customer_name_file, markdown_file, pdf_file, fileName, input_json_path, max_retries=10):
+    """
+    Run amendment pipeline with OpenAI rate limit handling
+    """
+    base_delay = 1
+    max_delay = 60
+    
+    for attempt in range(max_retries):
+        try:
+            # Add jitter to spread out requests from concurrent Lambdas
+            if attempt > 0:
+                jitter = random.uniform(0.5, 1.5)
+                delay = min(base_delay * (1.5 ** attempt) * jitter, max_delay)
+                logger.info(f"Rate limited in amendment pipeline, attempt {attempt + 1}/{max_retries}, waiting {delay:.2f} seconds")
+                await asyncio.sleep(delay)
+            
+            # Your original pipeline call (unchanged)
+            all_json = await amd_main.run_pipeline(
+                external_id_file=external_id_file,
+                customer_name_file=customer_name_file,
+                markdown_file=markdown_file,
+                pdf_file=pdf_file,
+                fileName=fileName,
+                input_json_path=input_json_path
+            )
+            
+            # If successful, return the result
+            if attempt > 0:
+                logger.info(f"Successfully processed amendment pipeline on attempt {attempt + 1}")
+            return all_json
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            
+            # Check if it's a rate limit error
+            if any(keyword in error_str for keyword in ['rate', '429', 'too many requests', 'rate limit', 'quota']):
+                if attempt == max_retries - 1:
+                    logger.error(f"Rate limit exceeded after {max_retries} attempts in amendment pipeline")
+                    raise Exception(f"OpenAI rate limit exceeded after {max_retries} attempts in amendment pipeline. Please try again later.")
+                
+                logger.warning(f"Rate limited in amendment pipeline on attempt {attempt + 1}/{max_retries}: {str(e)}")
+                continue  # Retry with backoff
+            else:
+                # Non-rate-limit error, fail immediately
+                logger.error(f"Non-rate-limit error in amendment pipeline: {str(e)}")
+                raise e
+    
+    # This should never be reached, but just in case
+    raise Exception(f"Max retries ({max_retries}) exceeded in amendment pipeline")
 
 async def amend_extraction(event, context):
     """
@@ -26,9 +77,7 @@ async def amend_extraction(event, context):
         
         logger.info(f"Received event: {json.dumps(event, indent=2)}")
         
-
         s3_client = boto3.client('s3')
-
 
         # Extract single file parameters (not files array)
         bucket = event.get('bucket')
@@ -72,8 +121,7 @@ async def amend_extraction(event, context):
 
         # print(json.dumps(json_dataframes["Contract"], indent=4))
 
-
-        ##### Extraction Pipeline #####
+        ##### Extraction Pipeline with retry logic #####
         s3_path = parsed_location.replace("s3://", "")
         buckett, key = s3_path.split("/", 1)
 
@@ -84,19 +132,20 @@ async def amend_extraction(event, context):
         s3_client.delete_object(Bucket=buckett, Key=key)  
 
         amd_main = AmendmentPipeline()
-        all_json = await amd_main.run_pipeline(
-            external_id_file=contract_external_id,
-            customer_name_file=customer_name,
-            markdown_file=parsed_content,
-            pdf_file = pdf_content,
-            fileName = fileName,
-            input_json_path = json_dataframes
+        
+        # Use the retry wrapper instead of direct call
+        all_json = await run_pipeline_with_retry(
+            amd_main,
+            contract_external_id,
+            customer_name,
+            parsed_content,
+            pdf_content,
+            fileName,
+            json_dataframes
         )
-
 
         # Store large content in S3
         result_key = f"amend_results/{uuid.uuid4()}_{fileName}_processed.json"
-
 
         s3_client.put_object(
             Bucket=bucket,
