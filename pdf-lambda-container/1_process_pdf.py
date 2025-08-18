@@ -3,9 +3,52 @@ import boto3
 import time
 import uuid
 import logging
+import random
 from pdf_parser import PDFParser
 
 logger = logging.getLogger(__name__)
+
+async def process_pdf_with_retry(pdf_parser, pdf_content, max_retries=10):
+    """
+    Process PDF with OpenAI rate limit handling
+    """
+    base_delay = 1
+    max_delay = 60
+    
+    for attempt in range(max_retries):
+        try:
+            # Add jitter to spread out requests from concurrent Lambdas
+            if attempt > 0:
+                jitter = random.uniform(0.5, 1.5)
+                delay = min(base_delay * (1.5 ** attempt) * jitter, max_delay)
+                logger.info(f"Rate limited, attempt {attempt + 1}/{max_retries}, waiting {delay:.2f} seconds")
+                await asyncio.sleep(delay)  # Use asyncio.sleep for async function
+            
+            # Your original OpenAI API call (unchanged)
+            parsed_content = await pdf_parser.parse_pdf(pdf_content)
+            
+            # If successful, return the result
+            logger.info(f"Successfully processed PDF on attempt {attempt + 1}")
+            return parsed_content
+            
+        except Exception as e:
+            error_str = str(e).lower()
+            
+            # Check if it's a rate limit error
+            if any(keyword in error_str for keyword in ['rate', '429', 'too many requests', 'rate limit', 'quota']):
+                if attempt == max_retries - 1:
+                    logger.error(f"Rate limit exceeded after {max_retries} attempts")
+                    raise Exception(f"OpenAI rate limit exceeded after {max_retries} attempts. Please try again later.")
+                
+                logger.warning(f"Rate limited on attempt {attempt + 1}/{max_retries}: {str(e)}")
+                continue  # Retry with backoff
+            else:
+                # Non-rate-limit error, fail immediately (don't retry for other errors)
+                logger.error(f"Non-rate-limit error occurred: {str(e)}")
+                raise e
+    
+    # This should never be reached, but just in case
+    raise Exception(f"Max retries ({max_retries}) exceeded")
 
 async def process_pdf(event, context):  # Make this async
     """
@@ -30,18 +73,18 @@ async def process_pdf(event, context):  # Make this async
         # Initialize important classes
         pdf_parser = PDFParser()
         
-        # Process the PDF
+        # Process the PDF with retry logic
         start_time = time.time()
-        # parsed_content = await pdf_parser.parse_pdf_from_s3(pdf_content)  # Add await
-        parsed_content = await pdf_parser.parse_pdf(pdf_content)
+        
+        # Use the new retry wrapper instead of direct call
+        parsed_content = await process_pdf_with_retry(pdf_parser, pdf_content)
         print(f"Parsed content from stage 1: {parsed_content}")
 
-        
         processing_time = time.time() - start_time
 
         # Store large content in S3
         result_key = f"processed/{uuid.uuid4()}_{file_name}_parsed.txt"
-
+        
         s3_client.put_object(
             Bucket=bucket_name,
             Key=result_key,

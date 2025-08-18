@@ -1,0 +1,112 @@
+{
+  "Comment": "Two-Stage PDF Processing State Machine with Separate Concurrency Controls",
+  "StartAt": "Stage1_ProcessPDFsInParallel",
+  "States": {
+    "Stage1_ProcessPDFsInParallel": {
+      "Type": "Map",
+      "ItemsPath": "$.files",
+      "MaxConcurrency": 6,
+      "Iterator": {
+        "StartAt": "Stage1_PDFToText",
+        "States": {
+          "Stage1_PDFToText": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-1:387082968990:function:pdf-processor-container",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 15,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "HandleError"
+              }
+            ],
+            "End": true
+          },
+          "HandleError": {
+            "Type": "Pass",
+            "Result": {
+              "status": "error",
+              "stage": "pdf_to_text_failed",
+              "message": "PDF to text processing failed"
+            },
+            "End": true
+          }
+        }
+      },
+      "Next": "Stage2_ProcessDataInParallel"
+    },
+    "Stage2_ProcessDataInParallel": {
+      "Type": "Map",
+      "ItemsPath": "$",
+      "MaxConcurrency": 6,
+      "Iterator": {
+        "StartAt": "CheckStage1Success",
+        "States": {
+          "CheckStage1Success": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.status",
+                "StringEquals": "error",
+                "Next": "SkipStage2"
+              }
+            ],
+            "Default": "Stage2_ExtractData"
+          },
+          "Stage2_ExtractData": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-southeast-1:387082968990:function:data-extractor-container",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 15,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "HandleStage2Error"
+              }
+            ],
+            "End": true
+          },
+          "HandleStage2Error": {
+            "Type": "Pass",
+            "Result": {
+              "status": "error",
+              "stage": "data_extraction_failed",
+              "message": "Data extraction processing failed"
+            },
+            "End": true
+          },
+          "SkipStage2": {
+            "Type": "Pass",
+            "Comment": "Skip Stage 2 if Stage 1 failed",
+            "End": true
+          }
+        }
+      },
+      "Next": "CollectResults"
+    },
+    "CollectResults": {
+      "Type": "Pass",
+      "End": true
+    }
+  }
+}
