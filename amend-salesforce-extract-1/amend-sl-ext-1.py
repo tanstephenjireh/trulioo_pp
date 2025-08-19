@@ -4,6 +4,7 @@ import pickle
 import logging
 import asyncio
 import base64
+from compile_records import RecordCompiler
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -58,22 +59,37 @@ async def amend_salesforce_extract(event, context):
 
         print("✅ JSON data loaded")
 
-        # STEP 2: Salesforce extraction
+        # STEP 2: Salesforce extraction and Match salesforce file id and created date with all json account names
         print("\n🔍 STEP 2: Salesforce extraction...")       
+        
+        compiler = RecordCompiler()
+        account_files, filename_to_account = compiler.compile(extraction_json=json_dataframes)
 
-        # STEP 3: Match salesforce file id and created date with all json account names
-        print("\n🔗 STEP 3: Matching account names...")
+        print("account_files:", account_files)
+        print("filename_to_account:", filename_to_account)
+
+        # STEP 3: Save the salesforce and matched data
+        print("\n🔗 STEP 3: Saving salesforce and matched data")
 
 
         # Store large content in S3
-        amend_salesforce_match_key = f"user-sessions/{user_id}/extractions/{extraction_id}/amend_match_salesforce_dataframe.json"
-
+        amend_account_files_key = f"user-sessions/{user_id}/extractions/{extraction_id}/amend_account_files.json"
         s3_client.put_object(
             Bucket=bucket,
-            Key=amend_salesforce_match_key,
-            Body=json.dumps(json_dataframes, indent=2), # Replace json_dataframes with actual data
+            Key=amend_account_files_key,
+            Body=json.dumps(account_files, indent=2), # Replace json_dataframes with actual data
             ContentType='application/json'
         )
+
+        # Store large content in S3
+        amend_filename_to_account_key = f"user-sessions/{user_id}/extractions/{extraction_id}/amend_filename_to_account.json"
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=amend_filename_to_account_key,
+            Body=json.dumps(filename_to_account, indent=2), # Replace json_dataframes with actual data
+            ContentType='application/json'
+        )
+
 
         # Simulate processing result for single file
         result = {
@@ -83,7 +99,8 @@ async def amend_salesforce_extract(event, context):
             'extraction_id': extraction_id,
             'user_id': user_id,
             'files': files,
-            'salesforce_data_location': f"s3://{bucket}/{amend_salesforce_match_key}",
+            'account_files_location': f"s3://{bucket}/{amend_account_files_key}",
+            'filename_to_account_location': f"s3://{bucket}/{amend_filename_to_account_key}",
             'processing_time': 12.5,  # Updated to reflect actual time including delay
             'preprocessing_complete': True
         }
@@ -100,7 +117,7 @@ async def amend_salesforce_extract(event, context):
             'extraction_id': event.get('extraction_id'),
             'user_id': event.get('user_id')
         }
-    
+
 # Lambda wrapper for async handler
 def handler(event, context):
     """Wrapper to run async lambda_handler"""
