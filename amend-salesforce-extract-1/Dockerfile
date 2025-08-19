@@ -7,6 +7,7 @@ RUN pip install -r requirements.txt
 
 # Copy all files to root
 COPY amend-sl-ext-1.py ${LAMBDA_TASK_ROOT}
+COPY compile_records.py ${LAMBDA_TASK_ROOT}
 COPY config.py ${LAMBDA_TASK_ROOT}
 
 CMD ["amend-sl-ext-1.handler"]

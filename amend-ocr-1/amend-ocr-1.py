@@ -6,7 +6,7 @@ import logging
 import asyncio
 import base64
 import random
-from ocr_check import PDFParser
+from ocr_check import AmdOcrChecker
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -14,9 +14,9 @@ logger.setLevel(logging.INFO)
 ## 1. Get the dataframe.json file saved in S3
 ## 2. Parse the amendment if account name match
 
-ocr_parser = PDFParser()
+ocr_parser = AmdOcrChecker()
 
-async def parse_pdf_with_retry(ocr_parser, pdf_content, json_dataframes, max_retries=10):
+async def parse_pdf_with_retry(ocr_parser, fileName, pdf_content, account_files, filename_to_account, max_retries=10):
     """
     Parse PDF with OpenAI rate limit handling
     """
@@ -33,14 +33,14 @@ async def parse_pdf_with_retry(ocr_parser, pdf_content, json_dataframes, max_ret
                 await asyncio.sleep(delay)
             
             # Your original OCR API call (unchanged)
-            output_markdown, contract_external_id, customer_name = await ocr_parser.parse_pdf(
-                pdf_content, json_dataframes
+            markdown_content, contractid, account_id, start_date, matched_start_date, accountname = await ocr_parser.check(
+                fileName, pdf_content, account_files, filename_to_account
             )
             
             # If successful, return the result
             if attempt > 0:
                 logger.info(f"Successfully processed OCR on attempt {attempt + 1}")
-            return output_markdown, contract_external_id, customer_name
+            return markdown_content, contractid, account_id, start_date, matched_start_date, accountname
             
         except Exception as e:
             error_str = str(e).lower()
@@ -113,16 +113,35 @@ async def amend_ocr(event, context):
             # Convert DataFrame to JSON (records format)
             json_dataframes[df_name] = df.to_dict('records')
 
+
+        # Load the account files and filename to account mapping
+        amend_account_files_path = f"user-sessions/{user_id}/extractions/{extraction_id}/amend_account_files.json"
+        s3_response_account = s3_client.get_object(
+            Bucket=bucket,
+            Key=amend_account_files_path
+        )
+        account_files = json.loads(s3_response_account['Body'].read().decode('utf-8'))
+
+        amend_filename_to_account_path = f"user-sessions/{user_id}/extractions/{extraction_id}/amend_filename_to_account.json"
+        s3_response_filename_to_account = s3_client.get_object(
+            Bucket=bucket,
+            Key=amend_filename_to_account_path
+        )
+        filename_to_account = json.loads(s3_response_filename_to_account['Body'].read().decode('utf-8'))
+        
+        print("account_files:", account_files)
+        print("filename_to_account:", filename_to_account)
+
         print("✅ JSON data loaded")
 
         # STEP 2: OCR Processing with retry logic
         print("\n🔍 STEP 2: OCR Processing...")
         
         # Use the retry wrapper instead of direct call
-        output_markdown, contract_external_id, customer_name = await parse_pdf_with_retry(
-            ocr_parser, pdf_content, json_dataframes
+        markdown_content, contractid, account_id, start_date, matched_start_date, accountname = await parse_pdf_with_retry(
+            ocr_parser, fileName, pdf_content, account_files, filename_to_account
         )
-        print(f"✅ OCR completed - Customer: {customer_name}, Contract ID: {contract_external_id}")
+        # print(f"✅ OCR completed - Customer: {customer_name}, Contract ID: {contract_external_id}")
 
         # Store large content in S3
         amend_parsed_key = f"amend_processed/{uuid.uuid4()}_{fileName}_parsed.txt"
@@ -130,9 +149,16 @@ async def amend_ocr(event, context):
         s3_client.put_object(
             Bucket=bucket,
             Key=amend_parsed_key,
-            Body=output_markdown,
+            Body=markdown_content,
             ContentType='text/plain'
         )
+
+        # print("markdown_content:", markdown_content)
+        print("contractid:", contractid)
+        print("account_id:", account_id)
+        print("start_date:", start_date)
+        print("matched_start_date:", matched_start_date)
+        print("accountname:", accountname)
 
         # Simulate processing result for single file
         result = {
@@ -144,8 +170,8 @@ async def amend_ocr(event, context):
             'size': size,
             'extraction_id': extraction_id,
             'user_id': user_id,
-            'contract_external_id': contract_external_id,
-            'customer_name': customer_name,
+            'contract_external_id': contractid,
+            'customer_name': accountname,
             'parsedLocation': f"s3://{bucket}/{amend_parsed_key}",
             'processing_time': 12.5  # Updated to reflect actual time including delay
         }
