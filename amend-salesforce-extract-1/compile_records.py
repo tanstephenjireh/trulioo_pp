@@ -16,29 +16,28 @@ Purpose:
 """
 import json
 import re
-from config import get_ssm_param
 from simple_salesforce import Salesforce
+from config import get_ssm_param
 
 class RecordCompiler:
-    def __init__(self):
+    def __init__(self, extraction_json):
+        self.extraction_json = extraction_json
         self.acc_dict = {}
         self.filename_to_account = {}
-        self.username = get_ssm_param("/myapp/sf_username")
-        self.password = get_ssm_param("/myapp/sf_password")
-        self.security_token = get_ssm_param("/myapp/sf_security_token")
-        self.domain = get_ssm_param("/myapp/sf_domain")
 
     def normalize_filename(self, name):
         # Remove all extensions (e.g., .pdf, .docx, .xlsx, etc.)
         return re.sub(r'(\.[a-zA-Z0-9]+)+$', '', name).strip().lower()
 
-    def query_salesforce(self):
+    def query_salesforce(self, return_records=False):
+
         sf = Salesforce(
-            username=self.username,
-            password=self.password,
-            security_token=self.security_token,
-            domain=self.domain
+            username = get_ssm_param("/myapp/sf_username")
+            password = get_ssm_param("/myapp/sf_password")
+            security_token = get_ssm_param("/myapp/sf_security_token")
+            domain = get_ssm_param("/myapp/sf_domain")
         )
+        # Query ContentDocumentLink/ContentDocument
         query = '''SELECT 
           ContentDocument.Title,
           LinkedEntityId,
@@ -65,13 +64,60 @@ class RecordCompiler:
             if acc_id not in self.acc_dict:
                 self.acc_dict[acc_id] = {'AccountName': acc_name, 'Files': {}}
             self.acc_dict[acc_id]['Files'][fname] = date
+        # Query Attachment (get ParentId = Contract Id)
+        attachment_query = '''SELECT Id, Name, ContentType, BodyLength, ParentId
+        FROM Attachment
+        WHERE ParentId IN (SELECT Id FROM Contract)'''
+        att_res = sf.query_all(attachment_query)
+        att_records = att_res['records']
+        # Collect all unique ParentIds (Contract Ids)
+        contract_ids = list({att['ParentId'] for att in att_records if 'ParentId' in att})
+        # Query Contracts for Account info
+        contract_info = {}
+        if contract_ids:
+            # Salesforce query limit: break into chunks of 2000
+            chunk_size = 2000
+            for i in range(0, len(contract_ids), chunk_size):
+                chunk = contract_ids[i:i+chunk_size]
+                ids_str = ",".join([f"'{cid}'" for cid in chunk])
+                contract_query = f"""SELECT Id, AccountId, Account.Name, StartDate FROM Contract WHERE Id IN ({ids_str})"""
+                contract_res = sf.query_all(contract_query)
+                for c in contract_res['records']:
+                    contract_info[c['Id']] = {
+                        'AccountId': c.get('AccountId'),
+                        'AccountName': c.get('Account', {}).get('Name') if c.get('Account') else None,
+                        'StartDate': c.get('StartDate')
+                    }
+        # Add Attachments to acc_dict
+        for att in att_records:
+            contract_id = att.get('ParentId')
+            fname = att.get('Name')
+            if not contract_id or not fname:
+                continue
+            cinfo = contract_info.get(contract_id)
+            if not cinfo:
+                continue
+            acc_id = cinfo['AccountId']
+            acc_name = cinfo['AccountName']
+            date = cinfo['StartDate']
+            if not acc_id:
+                continue
+            if acc_id not in self.acc_dict:
+                self.acc_dict[acc_id] = {'AccountName': acc_name, 'Files': {}}
+            self.acc_dict[acc_id]['Files'][fname] = date
+        if return_records:
+            return {
+                'contentdocument_records': records,
+                'attachment_records': att_records,
+                'contract_records': list(contract_info.values())
+            }
 
-    def compile(self, extraction_json):
+    def compile(self):
         # Step 1: Query Salesforce and build account_files.json
         self.query_salesforce()
         # Step 2: For each FileName in Logs, match to Files in acc_dict
-        data = extraction_json
-        
+        with open(self.extraction_json, 'r', encoding='utf-8') as f:
+            data = json.load(f)
         logs = data.get('Logs', [])
         # Build a lookup: normalized filename -> (AccountId, AccountName, StartDate)
         file_lookup = {}
@@ -95,10 +141,12 @@ class RecordCompiler:
 
 # if __name__ == '__main__':
 #     compiler = RecordCompiler('BACKEND/THIRDV/amendments/extracted_data_updated.json')
+#     # Optionally save raw Salesforce query output for debugging
+#     records = compiler.query_salesforce(return_records=True)
 #     account_files, filename_to_account = compiler.compile()
 #     print(json.dumps(account_files, indent=2))
 #     print(json.dumps(filename_to_account, indent=2))
-#     with open('account_files.json', 'w', encoding='utf-8') as f:
+#     with open('account_files3.json', 'w', encoding='utf-8') as f:
 #         json.dump(account_files, f, indent=2)
 #     with open('filename_to_account.json', 'w', encoding='utf-8') as f:
 #         json.dump(filename_to_account, f, indent=2)
