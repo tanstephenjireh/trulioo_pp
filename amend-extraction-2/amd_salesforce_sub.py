@@ -110,7 +110,7 @@ class SalesforceEnricher:
                 "SELECT Id, Name, SBQQ__PricingMethod__c, SBQQ__SubscriptionPricing__c, SBQQ__SubscriptionType__c, "
                 "SBQQ__BillingFrequency__c, SBQQ__ChargeType__c, SBQQ__BillingType__c, CreatedDate "
                 "FROM Product2 "
-                f"WHERE Family = 'Person Match' AND IsActive = TRUE AND Name IN ('{names_str}') "
+                f"WHERE Family = 'KYC Data' AND IsActive = TRUE AND Name IN ('{names_str}') " ##09/16 change
                 "ORDER BY Name, CreatedDate DESC"
             )
             res = self.sf.query_all(q)

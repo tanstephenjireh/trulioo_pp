@@ -467,7 +467,7 @@ class ContractExtractor:
 
             record = {
                 "subExternalId": entry.get("subExternalId", "NA"),
-                "ProductName": entry.get("subscriptionName", "NA"),
+                "ProductName": (entry.get("subscriptionName") + " Transactions") if entry.get("subscriptionName") and entry.get("subscriptionName") != "NA" else "NA", ## 09/02
                 "ContractExternalId": llm_response.get("contractExternalId", "NA"),
                 "ContractName": llm_response.get("AccountName", "NA"),
                 "CurrencyIsoCode": entry.get("CurrencyIsoCode", "NA"),

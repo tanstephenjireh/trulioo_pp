@@ -102,10 +102,10 @@ Do not include the Appendix sections in the extraction. Basically, extract all e
                                 print("Markdown extraction complete.")
                                 return (markdown_content, contractid, account_id, start_date, matched_start_date, accountname)
                             else:
-                                return ("unmatched", "no_external_id", account_id, accountname, None, None)
+                                return ("unmatched", "no_external_id", account_id, start_date, None, accountname)
                         except Exception:
-                            return ("unmatched", "no_external_id", account_id, accountname, None, None)
-                    return ("unmatched", "no_external_id", account_id, accountname, None, None)
+                            return ("unmatched", "no_external_id", account_id, start_date, None, accountname)
+                    return ("unmatched", "no_external_id", account_id, start_date, None, accountname)
         return ("unmatched", "no_external_id", None, None, None, None)
 
 # if __name__ == "__main__":

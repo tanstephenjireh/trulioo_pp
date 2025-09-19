@@ -23,11 +23,21 @@
             "Retry": [
               {
                 "ErrorEquals": [
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 90,
+                "MaxAttempts": 99,
+                "BackoffRate": 1.5,
+                "Comment": "Handle OpenAI rate limits for OCR processing"
+              },
+              {
+                "ErrorEquals": [
                   "States.TaskFailed"
                 ],
-                "IntervalSeconds": 5,
-                "MaxAttempts": 5,
-                "BackoffRate": 2
+                "IntervalSeconds": 30,
+                "MaxAttempts": 99,
+                "BackoffRate": 2,
+                "Comment": "Handle other task failures with original strategy"
               }
             ],
             "Catch": [
@@ -80,11 +90,21 @@
             "Retry": [
               {
                 "ErrorEquals": [
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 90,
+                "MaxAttempts": 99,
+                "BackoffRate": 1.5,
+                "Comment": "Handle OpenAI rate limits for data extraction"
+              },
+              {
+                "ErrorEquals": [
                   "States.TaskFailed"
                 ],
-                "IntervalSeconds": 5,
-                "MaxAttempts": 5,
-                "BackoffRate": 2
+                "IntervalSeconds": 30,
+                "MaxAttempts": 99,
+                "BackoffRate": 2,
+                "Comment": "Handle other task failures with original strategy"
               }
             ],
             "Catch": [
@@ -141,11 +161,21 @@
             "Retry": [
               {
                 "ErrorEquals": [
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 90,
+                "MaxAttempts": 99,
+                "BackoffRate": 1.5,
+                "Comment": "Handle OpenAI rate limits for sequential processing"
+              },
+              {
+                "ErrorEquals": [
                   "States.TaskFailed"
                 ],
-                "IntervalSeconds": 5,
-                "MaxAttempts": 5,
-                "BackoffRate": 2
+                "IntervalSeconds": 30,
+                "MaxAttempts": 99,
+                "BackoffRate": 2,
+                "Comment": "Handle other task failures with original strategy"
               }
             ],
             "Catch": [
@@ -181,11 +211,21 @@
       "Retry": [
         {
           "ErrorEquals": [
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 90,
+          "MaxAttempts": 99,
+          "BackoffRate": 1.5,
+          "Comment": "Handle OpenAI rate limits for Excel updates"
+        },
+        {
+          "ErrorEquals": [
             "States.TaskFailed"
           ],
-          "IntervalSeconds": 5,
-          "MaxAttempts": 5,
-          "BackoffRate": 2
+          "IntervalSeconds": 30,
+          "MaxAttempts": 99,
+          "BackoffRate": 2,
+          "Comment": "Handle other task failures with original strategy"
         }
       ],
       "Catch": [

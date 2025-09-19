@@ -172,6 +172,7 @@ async def amend_ocr(event, context):
             'user_id': user_id,
             'contract_external_id': contractid,
             'customer_name': accountname,
+            'start_date': start_date,
             'parsedLocation': f"s3://{bucket}/{amend_parsed_key}",
             'processing_time': 12.5  # Updated to reflect actual time including delay
         }

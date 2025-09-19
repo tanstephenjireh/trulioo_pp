@@ -1,0 +1,86 @@
+{
+  "Empirium": {
+    "contract": [],
+    "subscriptions": [
+      {
+        "SubscriptionDetails": [
+          {
+            "Field": "SubscriptionName",
+            "AI-Extracted": "Business Complete - GR1",
+            "Salesforce data": "Not found"
+          }
+        ],
+        "SubscriptionConsumptionSchedule": [],
+        "SubscriptionRates": [],
+        "LineItemSources": [
+          {
+            "LISConsumptionSchedule": [],
+            "LISConsumptionRate": []
+          }
+        ],
+        "discounts": [
+          {
+            "DiscountSchedule": [],
+            "DiscountRate": []
+          }
+        ]
+      }
+    ]
+  },
+  "UKIO SPAIN S.L. ESB67627232": {
+    "contract": [],
+    "subscriptions": [
+      {
+        "SubscriptionDetails": [
+          {
+            "Field": "SubscriptionName",
+            "AI-Extracted": "Brazil",
+            "Salesforce data": "Not found"
+          }
+        ],
+        "SubscriptionConsumptionSchedule": [],
+        "SubscriptionRates": [],
+        "LineItemSources": [
+          {
+            "LISConsumptionSchedule": [],
+            "LISConsumptionRate": []
+          }
+        ],
+        "discounts": [
+          {
+            "DiscountSchedule": [],
+            "DiscountRate": []
+          }
+        ]
+      }
+    ]
+  },
+  "AmWager": {
+    "contract": [],
+    "subscriptions": [
+      {
+        "SubscriptionDetails": [
+          {
+            "Field": "SubscriptionName",
+            "AI-Extracted": "Not found",
+            "Salesforce data": "API-CAN DocV"
+          }
+        ],
+        "SubscriptionConsumptionSchedule": [],
+        "SubscriptionRates": [],
+        "LineItemSources": [
+          {
+            "LISConsumptionSchedule": [],
+            "LISConsumptionRate": []
+          }
+        ],
+        "discounts": [
+          {
+            "DiscountSchedule": [],
+            "DiscountRate": []
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -91,6 +91,7 @@ async def amend_extraction(event, context):
         user_id = event.get('user_id')
         contract_external_id = event.get('contract_external_id')
         customer_name = event.get('customer_name')
+        start_date = event.get('start_date')
         
         # Download the PDF file from S3
         response = s3_client.get_object(Bucket=bucket, Key=key)
@@ -167,7 +168,8 @@ async def amend_extraction(event, context):
             'extraction_id': extraction_id,
             'user_id': user_id,
             'contract_external_id': contract_external_id,
-            'customer_name': customer_name,            
+            'customer_name': customer_name,
+            'start_date': start_date,            
             'resultLocation': f"s3://{bucket}/{result_key}",
             'processing_time': round(total_time, 2)
         }

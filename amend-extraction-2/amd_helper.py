@@ -47,7 +47,7 @@ def create_unmatched_output(pdf_file, customer_name, start_time):
                 "TimeStamp": datetime.now().isoformat(),
                 "FileName": pdf_file,
                 "AccountName": customer_name,
-                "Note": f"Account Name '{customer_name}' not found in the processed order forms"
+                "Note": f"Account not found in the processed order forms"
             }
         ]
     }

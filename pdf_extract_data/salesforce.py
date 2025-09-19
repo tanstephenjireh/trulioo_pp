@@ -72,7 +72,7 @@ class SalesForce:
     #======= Functions for subscription========
     def get_unique_product_names(self, subscriptions):
         # Gather all unique "ProductName Transactions" for querying Product2
-        return {f"{item['ProductName']} Transactions" for item in subscriptions if item.get("ProductName")}
+        return {item['ProductName'] for item in subscriptions if item.get("ProductName")} ## 09/02 change
 
     def fetch_product2_fields(self, sf, product_names, batch_size=100):
         if not product_names:
@@ -86,7 +86,7 @@ class SalesForce:
                 "SELECT Id, Name, SBQQ__PricingMethod__c, SBQQ__SubscriptionPricing__c, SBQQ__SubscriptionType__c, "
                 "SBQQ__BillingFrequency__c, SBQQ__ChargeType__c, SBQQ__BillingType__c, CreatedDate "
                 "FROM Product2 "
-                f"WHERE Family = 'Person Match' AND IsActive = TRUE AND Name IN ('{names_str}') "
+                f"WHERE Family = 'KYC Data' AND IsActive = TRUE AND Name IN ('{names_str}') " ## 09/16 change
                 "ORDER BY Name, CreatedDate DESC"
             )
             res = sf.query_all(q)
@@ -106,7 +106,7 @@ class SalesForce:
         ]
         for item in subscriptions:
             pname = item.get("ProductName")
-            key = f"{pname} Transactions"
+            key = pname  # No longer append ' Transactions' ## 09/02 change
             recs = product_field_map.get(key, [])
             if not recs:
                 item["ProductId"] = None
@@ -216,7 +216,7 @@ class SalesForce:
         subscription_names = list(subscription_names)
         latest = {}
         for i in range(0, len(subscription_names), batch_size):
-            batch = [f"{n} Transactions" for n in subscription_names[i:i+batch_size]]
+            batch = subscription_names[i:i+batch_size]  # No longer append ' Transactions' ## 09/02 change
             names_str = "', '".join(batch)
             q = (
                 f"SELECT Id, Name, CreatedDate FROM ConsumptionSchedule__c "
@@ -243,7 +243,7 @@ class SalesForce:
                 item.pop('pcsName', None)
             # --- Add subCsId from ConsumptionSchedule__c ---
             subscr_name = item.get("subscriptionName")
-            cs_name = f"{subscr_name} Transactions"
+            cs_name = subscr_name  # No longer append ' Transactions' ## 09/02 change
             consumption_id = consumption_schedule_map.get(cs_name)
             if consumption_id:
                 item['subCsId'] = consumption_id
