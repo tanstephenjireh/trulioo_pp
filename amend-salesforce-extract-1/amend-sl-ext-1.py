@@ -62,8 +62,8 @@ async def amend_salesforce_extract(event, context):
         # STEP 2: Salesforce extraction and Match salesforce file id and created date with all json account names
         print("\n🔍 STEP 2: Salesforce extraction...")       
         
-        compiler = RecordCompiler()
-        account_files, filename_to_account = compiler.compile(extraction_json=json_dataframes)
+        compiler = RecordCompiler(extraction_json=json_dataframes)
+        account_files, filename_to_account = compiler.compile()
 
         print("account_files:", account_files)
         print("filename_to_account:", filename_to_account)

@@ -31,13 +31,15 @@ class KYB:
         - If the Business Verification section does not exist, output {"start_line": "", "end_line": ""}.
         """
 
+        ## 09/20 change prompt update
+
         self.KYB_INSTRUCTION = """
         You are an intelligent field extractor. You are given a chunk of a document that contains the Business Verification pricing table.
 
         ## `subscription` (subscription level fields)
         For each row in the pricing table, create a subscription for each column that has a price value (such as but not limited to: Search, Essentials, Insights, Complete.)
-        - `ProductName`: Combine the Query Type (column) with the Group Number (row). Format: "Business <Query Type> - GR<Group Number>"
-        Examples: "Business Essentials - GR1", "Business Insights - GR1", "Business Complete - GR2", "Business Search - GR5"
+        - `ProductName`: Combine the Query Type (column) with the Group Number (row). Format: "Business <Query Type> - Group <Group Number>"
+        Examples: "Business Essentials - Group 1", "Business Insights - Group 1", "Business Complete - Group 3", "Business Search - Group 2"
 
         ## `scr` (subscription consumption rate for this subscription)
         For each subscription created above, create one scr record:

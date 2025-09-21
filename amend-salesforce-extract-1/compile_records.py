@@ -32,9 +32,9 @@ class RecordCompiler:
     def query_salesforce(self, return_records=False):
 
         sf = Salesforce(
-            username = get_ssm_param("/myapp/sf_username")
-            password = get_ssm_param("/myapp/sf_password")
-            security_token = get_ssm_param("/myapp/sf_security_token")
+            username = get_ssm_param("/myapp/sf_username"),
+            password = get_ssm_param("/myapp/sf_password"),
+            security_token = get_ssm_param("/myapp/sf_security_token"),
             domain = get_ssm_param("/myapp/sf_domain")
         )
         # Query ContentDocumentLink/ContentDocument
@@ -116,9 +116,7 @@ class RecordCompiler:
         # Step 1: Query Salesforce and build account_files.json
         self.query_salesforce()
         # Step 2: For each FileName in Logs, match to Files in acc_dict
-        with open(self.extraction_json, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        logs = data.get('Logs', [])
+        logs = self.extraction_json.get('Logs', [])
         # Build a lookup: normalized filename -> (AccountId, AccountName, StartDate)
         file_lookup = {}
         for acc_id, acc_info in self.acc_dict.items():

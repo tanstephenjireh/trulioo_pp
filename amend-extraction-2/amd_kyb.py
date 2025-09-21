@@ -17,6 +17,7 @@ class KYBExtractor:
         self.domain = get_ssm_param("/myapp/sf_domain")
         
         # ========== KYB BOUNDARIES INSTRUCTION ==========
+        ## 09/20 change prompt update
         self.KYB_BOUNDARIES_INSTRUCTION = """
 You are an expert contract parser. 
 Your job is to find the exact line text that marks the START and END of the Business Verification section.
